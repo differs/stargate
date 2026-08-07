@@ -26,6 +26,8 @@ pub struct PortalState {
     pub jwt: Option<crate::jwt::JwtManager>,
     /// OIDC client (optional).
     pub oidc: Option<std::sync::Arc<OidcClient>>,
+    /// Merchant portal static directory (optional).
+    pub web_dir: Option<String>,
 }
 
 /// OIDC authorization-code client (discovery + exchange + verify).
@@ -89,8 +91,10 @@ impl OidcClient {
     }
 }
 
+/// Build the portal router; serves static merchant portal files at /
+/// when web_dir is set.
 pub fn router(state: Arc<PortalState>) -> Router {
-    Router::new()
+    let mut app = Router::new()
         .route("/api/register", post(register))
         .route("/api/login", post(login))
         .route("/api/keys", post(create_key).get(list_keys))
@@ -99,7 +103,11 @@ pub fn router(state: Arc<PortalState>) -> Router {
         .route("/api/recharge/status", axum::routing::get(recharge_status))
         .route("/api/oidc/login", axum::routing::get(oidc_login))
         .route("/api/oidc/callback", axum::routing::get(oidc_callback))
-        .with_state(state)
+        .route("/api/balance", axum::routing::get(balance));
+    if let Some(dir) = &state.web_dir {
+        app = app.fallback_service(tower_http::services::ServeDir::new(dir));
+    }
+    app.with_state(state)
 }
 
 /// Auth: admin key OR valid session JWT.
@@ -180,6 +188,33 @@ async fn oidc_callback(
             tracing::warn!("oidc callback failed: {e:?}");
             (StatusCode::UNAUTHORIZED, Json(json!({"error": format!("oidc failed: {e}")}))).into_response()
         }
+    }
+}
+
+/// GET /api/balance — authenticated user's Redis balance (JWT context).
+async fn balance(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap) -> Response {
+    let Some(jwt) = &st.jwt else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "jwt disabled"}))).into_response();
+    };
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    match jwt.verify(token) {
+        Ok(claims) => {
+            let redis_addr = std::env::var("STARGATE_REDIS_ADDR").unwrap_or_default();
+            match redis::Client::open(format!("redis://{redis_addr}"))
+                .and_then(|c| c.get_connection())
+            {
+                Ok(mut conn) => {
+                    let bal: i64 = redis::cmd("GET")
+                        .arg(format!("balance:user-{}", claims.uid))
+                        .query(&mut conn)
+                        .unwrap_or(0);
+                    (StatusCode::OK, Json(json!({"user_id": claims.uid, "balance_micros": bal}))).into_response()
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("redis: {e}")}))).into_response(),
+            }
+        }
+        Err(_) => (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response(),
     }
 }
 

@@ -152,6 +152,10 @@ async fn main() {
                     admin_key: env_or("STARGATE_PORTAL_KEY", ""),
                     jwt: jwt_mgr,
                     oidc: oidc_client,
+                    web_dir: {
+                        let d = env_or("STARGATE_WEB_DIR", "");
+                        if d.is_empty() { None } else { Some(d) }
+                    },
                 });
                 let app2 = portal::router(portal_state);
                 let portal_port = env_or("STARGATE_PORTAL_PORT", "3202");
