@@ -172,6 +172,11 @@ STARGATE_JWT_SECRET=<32+ bytes> STARGATE_OIDC_PROVIDER_URL=https://accounts.goog
   auto-registers/resolves the local account and returns a session JWT.
 - Verified end-to-end: login → JWT → create key with JWT (no admin
   key); forged JWT rejected 401.
+- OIDC verified against a live IdP (deploy/dex/mock-oidc in the Go
+  repo): full flow passes — discovery, authorize redirect, code
+  exchange, RS256 id_token verification via JWKS, nonce, auto-register,
+  session JWT. openidconnect crate quirks handled: authorize_url
+  closures, tuple url(), nonce claim required.
 
 ## Observability
 

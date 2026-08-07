@@ -176,7 +176,10 @@ async fn oidc_callback(
             }
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(e) => (StatusCode::UNAUTHORIZED, Json(json!({"error": format!("oidc failed: {e}")}))).into_response(),
+        Err(e) => {
+            tracing::warn!("oidc callback failed: {e:?}");
+            (StatusCode::UNAUTHORIZED, Json(json!({"error": format!("oidc failed: {e}")}))).into_response()
+        }
     }
 }
 
