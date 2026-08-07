@@ -142,6 +142,23 @@ Stargate syncs the accuracy-first fixes from the Go implementation:
   API, ClickHouse details) live in MeterGate where the full platform
   stack exists.
 
+## Commercial stack (P0: can take money)
+
+```bash
+STARGATE_PORTAL_PORT=3202 STARGATE_PORTAL_KEY=admin-secret \
+STARGATE_PG_DSN=postgres://... ./target/release/stargate
+
+curl -X POST localhost:3202/api/register -d '{"username":"bob","password":"password123"}'
+curl -X POST "localhost:3202/api/keys?user_id=1" -d '{"name":"prod"}'
+curl -X POST "localhost:3202/api/recharge?user_id=1" -d '{"amount_micros":50000000,"idempotency_key":"r1"}'
+curl -X POST localhost:3202/api/recharge/pay -d '{"recharge_id":1,"channel":"mock"}'
+# consume with the issued sk- key (static allowlist OR stored keys, cached)
+```
+
+Verified end-to-end: register → login → key → recharge → mock pay →
+consume with the new key → balance exact; duplicate callback no-ops
+(money safe). Mirrors MeterGate's commercial stack.
+
 ## Observability
 
 `GET /metrics` (Prometheus text format): HTTP requests by status class,

@@ -11,12 +11,15 @@
 //! under identical conditions (same mock upstream, same load generator).
 //! See README.md for the benchmark matrix.
 
+mod auth;
 mod billing;
 #[cfg(test)]
 mod billing_tests;
 mod gateway;
 mod metering;
 mod openai;
+mod payment;
+mod portal;
 mod upstream;
 
 use std::env;
@@ -76,7 +79,67 @@ async fn main() {
         None
     };
 
-    let app = gateway::router_with_billing(cfg, billing);
+    // --- P0 commercial: auth + payment + portal (requires PG) ---
+    let mut key_store = None;
+    if !pg_dsn.is_empty() {
+        match auth::AuthService::connect(&pg_dsn).await {
+            Ok(auth_svc) => {
+                let auth_svc = std::sync::Arc::new(auth_svc);
+                let ks = std::sync::Arc::new(auth::CachedKeyStore::new(
+                    auth_svc.as_ref().clone(),
+                    std::time::Duration::from_secs(60),
+                ));
+
+                let pay_svc = payment::PaymentService::new(
+                    auth_svc.inner(),
+                    Box::new(move |user_id: i64, amount: i64| {
+                        let redis_addr = redis_addr.clone();
+                        Box::pin(async move {
+                            let client = redis::Client::open(format!("redis://{redis_addr}"))
+                                .map_err(|e| e.to_string())?;
+                            let mut conn = client
+                                .get_multiplexed_tokio_connection()
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            redis::cmd("INCRBY")
+                                .arg(format!("balance:user-{user_id}"))
+                                .arg(amount)
+                                .query_async::<i64>(&mut conn)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            Ok(())
+                        })
+                    }),
+                );
+                let mut pay_svc = pay_svc;
+                pay_svc.register_channel(Box::new(payment::MockChannel));
+
+                let portal_state = std::sync::Arc::new(portal::PortalState {
+                    auth: auth_svc.as_ref().clone(),
+                    keys: ks.clone(),
+                    pay: pay_svc,
+                    admin_key: env_or("STARGATE_PORTAL_KEY", ""),
+                });
+                let app2 = portal::router(portal_state);
+                let portal_port = env_or("STARGATE_PORTAL_PORT", "3202");
+                let portal_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{portal_port}"))
+                    .await
+                    .expect("portal bind");
+                tokio::spawn(async move {
+                    tracing::info!("stargate portal listening on :{portal_port}");
+                    let _ = axum::serve(portal_listener, app2).await;
+                });
+
+                key_store = Some(ks);
+                tracing::info!("commercial stack enabled (users/keys/recharge/pay)");
+            }
+            Err(e) => {
+                tracing::error!("auth service failed, portal disabled: {e}");
+            }
+        }
+    }
+
+    let app = gateway::router_full(cfg, billing, key_store);
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("stargate listening on {addr} (upstream: {upstream_url})");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");

@@ -51,14 +51,25 @@ pub struct AppState {
     upstream: UpstreamClient,
     keys: HashSet<String>,
     billing: Option<Arc<BillingHandle>>,
+    /// Optional DB-backed key resolution (static allowlist checked first).
+    key_store: Option<Arc<crate::auth::CachedKeyStore>>,
 }
 
 pub fn router_with_billing(cfg: Arc<Config>, billing: Option<Arc<BillingHandle>>) -> Router {
+    router_full(cfg, billing, None)
+}
+
+pub fn router_full(
+    cfg: Arc<Config>,
+    billing: Option<Arc<BillingHandle>>,
+    key_store: Option<Arc<crate::auth::CachedKeyStore>>,
+) -> Router {
     let keys: HashSet<String> = cfg.api_keys.iter().cloned().collect();
     let state = Arc::new(AppState {
         upstream: UpstreamClient::new(cfg.upstream_url.clone(), cfg.upstream_key.clone()),
         keys,
         billing,
+        key_store,
         cfg,
     });
     Router::new()
@@ -102,16 +113,26 @@ fn unauthorized() -> Response {
     .into_response()
 }
 
-fn auth_check(headers: &HeaderMap, keys: &HashSet<String>) -> Result<String, Response> {
+async fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let key = auth.strip_prefix("Bearer ").unwrap_or("").trim();
-    if key.is_empty() || !keys.contains(key) {
+    if key.is_empty() {
         return Err(unauthorized());
     }
-    Ok(key.to_string())
+    if state.keys.contains(key) {
+        return Ok(key.to_string()); // static allowlist fast path
+    }
+    // DB-backed stored keys (cached)
+    if let Some(ks) = &state.key_store {
+        match ks.resolve(key).await {
+            Ok(uid) => return Ok(format!("user-{uid}")),
+            Err(_) => return Err(unauthorized()),
+        }
+    }
+    Err(unauthorized())
 }
 
 async fn handle_chat(
@@ -119,7 +140,7 @@ async fn handle_chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let user = match auth_check(&headers, &state.keys) {
+    let user = match auth_check(&state, &headers).await {
         Ok(u) => u,
         Err(r) => {
             record_http(401);
