@@ -1,0 +1,22 @@
+[package]
+name = "stargate"
+version = "0.1.0"
+edition = "2024"
+description = "Rust re-implementation of MeterGate's data plane — OpenAI-compatible LLM gateway with streaming token metering. Performance comparison baseline against the Go version."
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"], default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v7"] }
+futures-util = "0.3"
+bytes = "1"
+tokio-stream = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
