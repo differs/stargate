@@ -100,6 +100,10 @@ async fn handle_chat(
     let request_id = Uuid::now_v7().to_string();
     let prompt_tokens = metering::estimate_prompt_tokens(&req.messages);
 
+    // Freeze the price at request start: settlement must use this, never
+    // the current table (in-flight requests are not repriced).
+    let pricing = Some(billing::price_for(&req.model));
+
     // Billing fast path: atomic pre-charge before touching the upstream.
     if let Some(bh) = &state.billing {
         if let Some(pre) = &bh.pre {
@@ -116,9 +120,9 @@ async fn handle_chat(
     }
 
     if req.stream {
-        handle_stream(state, body, request_id, prompt_tokens, req.model, user).await
+        handle_stream(state, body, request_id, prompt_tokens, req.model, user, pricing).await
     } else {
-        handle_non_stream(state, body, request_id, prompt_tokens, req.model, user).await
+        handle_non_stream(state, body, request_id, prompt_tokens, req.model, user, pricing).await
     }
 }
 
@@ -129,6 +133,7 @@ async fn handle_non_stream(
     prompt_tokens: u32,
     model: String,
     user: String,
+    pricing: Option<billing::ModelPrice>,
 ) -> Response {
     let start = std::time::Instant::now();
     let _ = &user; // used by event attribution
@@ -159,7 +164,7 @@ async fn handle_non_stream(
 
     let event_status = if (200..300).contains(&status) { "completed" } else { "failed" };
     metering_event(&request_id, event_status, prompt_tokens, completion, start);
-    emit_to_settler(&state, &request_id, &user, &model, event_status, prompt_tokens, completion, start);
+    emit_to_settler(&state, &request_id, &user, &model, event_status, prompt_tokens, completion, start, pricing);
 
     (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), resp_body).into_response()
 }
@@ -171,6 +176,7 @@ async fn handle_stream(
     prompt_tokens: u32,
     model: String,
     user: String,
+    pricing: Option<billing::ModelPrice>,
 ) -> Response {
     let start = std::time::Instant::now();
     let acc = Arc::new(Accumulator::new());
@@ -240,7 +246,7 @@ async fn handle_stream(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(0)).await;
         metering_event(&request_id, "completed", prompt_tokens, completion, start);
-        emit_to_settler(&state2, &request_id, &user2, &model, "completed", prompt_tokens, completion, start);
+        emit_to_settler(&state2, &request_id, &user2, &model, "completed", prompt_tokens, completion, start, pricing);
     });
 
     resp
@@ -255,6 +261,7 @@ fn emit_to_settler(
     prompt: u32,
     completion: u32,
     start: std::time::Instant,
+    pricing: Option<billing::ModelPrice>,
 ) {
     if let Some(bh) = &state.billing {
         let ev = billing::MeteringEvent {
@@ -267,6 +274,7 @@ fn emit_to_settler(
             completion_tokens: completion as i64,
             duration_ms: start.elapsed().as_millis() as i64,
             ttft_ms: 0,
+            pricing,
         };
         let settler = bh.settler.clone();
         tokio::spawn(async move {

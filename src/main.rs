@@ -12,6 +12,8 @@
 //! See README.md for the benchmark matrix.
 
 mod billing;
+#[cfg(test)]
+mod billing_tests;
 mod gateway;
 mod metering;
 mod openai;

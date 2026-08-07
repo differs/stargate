@@ -103,6 +103,21 @@ so multiple rounds were taken; the Rust lead was consistent in every round.
    ClickHouse) lives in MeterGate and was verified exact under 22K req/s;
    Stargate is the data-plane comparison baseline.
 
+## Accuracy parity with MeterGate
+
+Stargate syncs the accuracy-first fixes from the Go implementation:
+
+- **Request-start price snapshots**: prices are frozen into the metering
+  event when the request arrives; settlement uses the snapshot, never the
+  current table — a mid-request price change cannot reprice in-flight
+  requests.
+- **Tests** (`cargo test`): snapshot pricing wins over table changes,
+  legacy events fall back to current prices, zero-completion insurance
+  (failed = free), pre-charge cap, shard-hash stability.
+- The remaining accuracy modules (supplier reconciliation, traceability
+  API, ClickHouse details) live in MeterGate where the full platform
+  stack exists.
+
 ## Run
 
 ```bash

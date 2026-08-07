@@ -312,6 +312,17 @@ pub struct MeteringEvent {
     pub completion_tokens: i64,
     pub duration_ms: i64,
     pub ttft_ms: i64,
+    /// Prices frozen at REQUEST START. Settlement MUST use this, never
+    /// the current table — a mid-request price change must not reprice
+    /// in-flight requests (accuracy gap #1, same fix as MeterGate).
+    pub pricing: Option<ModelPrice>,
+}
+
+/// Price frozen at request start.
+#[derive(Clone, Copy)]
+pub struct PriceSnapshot {
+    pub input_per_1m: i64,
+    pub output_per_1m: i64,
 }
 
 struct Shard {
@@ -326,7 +337,7 @@ pub struct Settler {
     shards: Vec<Arc<Shard>>,
 }
 
-fn shard_index(key: &str, n: usize) -> usize {
+pub(crate) fn shard_index(key: &str, n: usize) -> usize {
     let mut h: u32 = 0x811c9dc5;
     for b in key.bytes() {
         h ^= b as u32;
@@ -389,13 +400,16 @@ impl Settler {
     }
 }
 
-fn order_from_event(ev: &MeteringEvent) -> Order {
+pub(crate) fn order_from_event(ev: &MeteringEvent) -> Order {
     let status = if ev.status == "failed" { "NO_CHARGE" } else { "SETTLED" };
     let completion = if ev.status == "failed" { 0 } else { ev.completion_tokens };
+    // Price from the REQUEST-START snapshot; fall back to the current
+    // table only for legacy events without a snapshot.
+    let p = ev.pricing.unwrap_or_else(|| price_for(&ev.model));
     let amount = if ev.status == "failed" {
         0 // zero-completion insurance: failed requests are free
     } else {
-        calculate_amount(ev.prompt_tokens, completion, price_for(&ev.model))
+        calculate_amount(ev.prompt_tokens, completion, p)
     };
     Order {
         request_id: ev.request_id.clone(),
