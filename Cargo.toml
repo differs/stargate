@@ -16,6 +16,9 @@ uuid = { version = "1", features = ["v7"] }
 futures-util = "0.3"
 bytes = "1"
 tokio-stream = "0.1"
+redis = { version = "0.27", features = ["tokio-comp", "aio", "connection-manager", "script"] }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
 
 [profile.release]
 lto = true

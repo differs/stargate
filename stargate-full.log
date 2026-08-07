@@ -1,0 +1,4 @@
+[2m2026-08-07T06:53:15.560405Z[0m [32m INFO[0m [2mtokio_postgres::connection[0m[2m:[0m NOTICE: relation "orders" already exists, skipping
+[2m2026-08-07T06:53:15.561472Z[0m [32m INFO[0m [2mtokio_postgres::connection[0m[2m:[0m NOTICE: relation "idx_orders_user_created" already exists, skipping
+[2m2026-08-07T06:53:15.561846Z[0m [32m INFO[0m [2mstargate[0m[2m:[0m dual-track billing enabled (redis + postgres)
+[2m2026-08-07T06:53:15.561887Z[0m [32m INFO[0m [2mstargate[0m[2m:[0m stargate listening on 0.0.0.0:3200 (upstream: http://127.0.0.1:9901/v1/chat/completions)

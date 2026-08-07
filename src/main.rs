@@ -11,6 +11,7 @@
 //! under identical conditions (same mock upstream, same load generator).
 //! See README.md for the benchmark matrix.
 
+mod billing;
 mod gateway;
 mod metering;
 mod openai;
@@ -50,14 +51,43 @@ async fn main() {
     }
 
     let cfg = Arc::new(gateway::Config {
-        upstream_url,
+        upstream_url: upstream_url.clone(),
         upstream_key,
         api_keys,
     });
 
-    let app = gateway::router(cfg);
+    // --- optional billing stack (Redis pre-charge + PG settle) ---
+    let redis_addr = env_or("STARGATE_REDIS_ADDR", "");
+    let pg_dsn = env_or("STARGATE_PG_DSN", "");
+    let billing = if !redis_addr.is_empty() && !pg_dsn.is_empty() {
+        match init_billing(&redis_addr, &pg_dsn).await {
+            Ok(bh) => {
+                tracing::info!("dual-track billing enabled (redis + postgres)");
+                Some(Arc::new(bh))
+            }
+            Err(e) => {
+                tracing::error!("billing init failed, running without: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let app = gateway::router_with_billing(cfg, billing);
     let addr = format!("0.0.0.0:{port}");
-    tracing::info!("stargate listening on {addr} (upstream: {})", env_or("STARGATE_UPSTREAM", ""));
+    tracing::info!("stargate listening on {addr} (upstream: {upstream_url})");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+async fn init_billing(redis_addr: &str, pg_dsn: &str) -> Result<billing::BillingHandle, String> {
+    let store = std::sync::Arc::new(billing::PostgresStore::connect(pg_dsn).await?);
+    let pre = billing::Precharger::connect(redis_addr).await?;
+    let settler = std::sync::Arc::new(billing::Settler::new(store.clone(), Some(pre), 500).await);
+    Ok(billing::BillingHandle {
+        pre: Some(std::sync::Arc::new(billing::Precharger::connect(redis_addr).await?)),
+        settler,
+        store,
+    })
 }

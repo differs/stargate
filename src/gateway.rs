@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use futures_util::StreamExt;
 
+use crate::billing::{self, BillingHandle};
 use crate::metering::{self, Accumulator};
 use crate::openai::{self, ChatRequest};
 use crate::upstream::UpstreamClient;
@@ -28,19 +29,25 @@ pub struct AppState {
     cfg: Arc<Config>,
     upstream: UpstreamClient,
     keys: HashSet<String>,
+    billing: Option<Arc<BillingHandle>>,
 }
 
-pub fn router(cfg: Arc<Config>) -> Router {
+pub fn router_with_billing(cfg: Arc<Config>, billing: Option<Arc<BillingHandle>>) -> Router {
     let keys: HashSet<String> = cfg.api_keys.iter().cloned().collect();
     let state = Arc::new(AppState {
         upstream: UpstreamClient::new(cfg.upstream_url.clone(), cfg.upstream_key.clone()),
         keys,
+        billing,
         cfg,
     });
     Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
         .with_state(state)
+}
+
+pub fn router(cfg: Arc<Config>) -> Router {
+    router_with_billing(cfg, None)
 }
 
 fn unauthorized() -> Response {
@@ -67,7 +74,7 @@ async fn handle_chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let _user = match auth_check(&headers, &state.keys) {
+    let user = match auth_check(&headers, &state.keys) {
         Ok(u) => u,
         Err(r) => return r,
     };
@@ -93,10 +100,25 @@ async fn handle_chat(
     let request_id = Uuid::now_v7().to_string();
     let prompt_tokens = metering::estimate_prompt_tokens(&req.messages);
 
+    // Billing fast path: atomic pre-charge before touching the upstream.
+    if let Some(bh) = &state.billing {
+        if let Some(pre) = &bh.pre {
+            let p = billing::price_for(&req.model);
+            let amount = billing::estimate_precharge(prompt_tokens as i64, req.max_tokens, p);
+            if let Err(_e) = pre.precharge(&user, &request_id, amount).await {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    Json(serde_json::json!({"error": {"message": "insufficient balance"}})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     if req.stream {
-        handle_stream(state, body, request_id, prompt_tokens).await
+        handle_stream(state, body, request_id, prompt_tokens, req.model, user).await
     } else {
-        handle_non_stream(state, body, request_id, prompt_tokens).await
+        handle_non_stream(state, body, request_id, prompt_tokens, req.model, user).await
     }
 }
 
@@ -105,8 +127,11 @@ async fn handle_non_stream(
     body: Bytes,
     request_id: String,
     prompt_tokens: u32,
+    model: String,
+    user: String,
 ) -> Response {
     let start = std::time::Instant::now();
+    let _ = &user; // used by event attribution
     let (status, resp_body) = match state.upstream.forward(body).await {
         Ok(r) => r,
         Err(e) => {
@@ -134,6 +159,7 @@ async fn handle_non_stream(
 
     let event_status = if (200..300).contains(&status) { "completed" } else { "failed" };
     metering_event(&request_id, event_status, prompt_tokens, completion, start);
+    emit_to_settler(&state, &request_id, &user, &model, event_status, prompt_tokens, completion, start);
 
     (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), resp_body).into_response()
 }
@@ -143,6 +169,8 @@ async fn handle_stream(
     body: Bytes,
     request_id: String,
     prompt_tokens: u32,
+    model: String,
+    user: String,
 ) -> Response {
     let start = std::time::Instant::now();
     let acc = Arc::new(Accumulator::new());
@@ -207,14 +235,44 @@ async fn handle_stream(
 
     // emit the metering event after the stream completes
     let completion = acc.completion();
+    let state2 = state.clone();
+    let user2 = user.clone();
     tokio::spawn(async move {
-        // brief yield so the response headers flush first; event is
-        // best-effort at debug level anyway
         tokio::time::sleep(std::time::Duration::from_millis(0)).await;
         metering_event(&request_id, "completed", prompt_tokens, completion, start);
+        emit_to_settler(&state2, &request_id, &user2, &model, "completed", prompt_tokens, completion, start);
     });
 
     resp
+}
+
+fn emit_to_settler(
+    state: &AppState,
+    request_id: &str,
+    user_id: &str,
+    model: &str,
+    status: &str,
+    prompt: u32,
+    completion: u32,
+    start: std::time::Instant,
+) {
+    if let Some(bh) = &state.billing {
+        let ev = billing::MeteringEvent {
+            request_id: request_id.to_string(),
+            user_id: user_id.to_string(),
+            model: model.to_string(),
+            provider: state.upstream.url().to_string(),
+            status: status.to_string(),
+            prompt_tokens: prompt as i64,
+            completion_tokens: completion as i64,
+            duration_ms: start.elapsed().as_millis() as i64,
+            ttft_ms: 0,
+        };
+        let settler = bh.settler.clone();
+        tokio::spawn(async move {
+            settler.handle(ev).await;
+        });
+    }
 }
 
 fn metering_event(request_id: &str, status: &str, prompt: u32, completion: u32, start: std::time::Instant) {
