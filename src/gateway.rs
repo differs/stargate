@@ -17,7 +17,28 @@ use crate::billing::{self, BillingHandle};
 use crate::metering::{self, Accumulator};
 use crate::openai::{self, ChatRequest};
 use crate::upstream::UpstreamClient;
+use prometheus::{Encoder, IntCounter, IntCounterVec, Opts, TextEncoder};
+use std::sync::LazyLock;
 use uuid::Uuid;
+
+// --- basic metrics (observability parity, minimal set) ---
+// CounterVec::new does NOT register into the default registry — register
+// a clone so prometheus::gather() (used by /metrics) sees the series.
+fn registered_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    let c = IntCounterVec::new(Opts::new(name, help), labels).unwrap();
+    let _ = prometheus::register(Box::new(c.clone())); // ignore duplicate-reg errors
+    c
+}
+
+static HTTP_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    registered_counter("stargate_http_requests_total", "HTTP requests by status class", &["code"])
+});
+static PRECHARGE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    registered_counter("stargate_precharge_total", "Pre-charge attempts by result", &["result"])
+});
+static ORDERS_SETTLED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    registered_counter("stargate_orders_settled_total", "Settled orders by status", &["status"])
+});
 
 pub struct Config {
     pub upstream_url: String,
@@ -43,11 +64,35 @@ pub fn router_with_billing(cfg: Arc<Config>, billing: Option<Arc<BillingHandle>>
     Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
+        .route("/metrics", axum::routing::get(metrics_handler))
         .with_state(state)
 }
 
 pub fn router(cfg: Arc<Config>) -> Router {
     router_with_billing(cfg, None)
+}
+
+async fn metrics_handler() -> impl axum::response::IntoResponse {
+    let mut buffer = Vec::new();
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    (StatusCode::OK, String::from_utf8_lossy(&buffer).to_string())
+}
+
+pub fn record_http(code: u16) {
+    let class = format!("{}xx", code / 100);
+    HTTP_REQUESTS.with_label_values(&[&class]).inc();
+}
+
+pub fn record_precharge(result: &str) {
+    PRECHARGE_TOTAL.with_label_values(&[result]).inc();
+}
+
+pub fn record_orders(status: &str, n: usize) {
+    ORDERS_SETTLED.with_label_values(&[status]).inc_by(n as u64);
 }
 
 fn unauthorized() -> Response {
@@ -76,8 +121,12 @@ async fn handle_chat(
 ) -> Response {
     let user = match auth_check(&headers, &state.keys) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => {
+            record_http(401);
+            return r;
+        }
     };
+    record_http(200); // optimistic; failures recorded at their sites
 
     let req: ChatRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -109,7 +158,9 @@ async fn handle_chat(
         if let Some(pre) = &bh.pre {
             let p = billing::price_for(&req.model);
             let amount = billing::estimate_precharge(prompt_tokens as i64, req.max_tokens, p);
+            record_precharge("ok");
             if let Err(_e) = pre.precharge(&user, &request_id, amount).await {
+                record_precharge("insufficient");
                 return (
                     StatusCode::PAYMENT_REQUIRED,
                     Json(serde_json::json!({"error": {"message": "insufficient balance"}})),

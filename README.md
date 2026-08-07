@@ -142,6 +142,12 @@ Stargate syncs the accuracy-first fixes from the Go implementation:
   API, ClickHouse details) live in MeterGate where the full platform
   stack exists.
 
+## Observability
+
+`GET /metrics` (Prometheus text format): HTTP requests by status class,
+pre-charge attempts by result, settled orders by status. Scrape it with
+the same Prometheus + alerting setup as MeterGate.
+
 ## Run
 
 ```bash

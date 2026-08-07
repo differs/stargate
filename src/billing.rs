@@ -443,6 +443,7 @@ async fn flush_shard(
         tracing::error!(count = orders.len(), err = %e, "batch order insert failed");
         return;
     }
+    crate::gateway::record_orders("settled", orders.len());
     if let Some(pre) = pre {
         // batch settle via one pipeline round-trip
         let _ = pre.batch_settle(&orders, &events).await;
