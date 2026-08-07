@@ -1,1 +1,0 @@
-[2m2026-08-07T05:59:49.856368Z[0m [32m INFO[0m [2mstargate[0m[2m:[0m stargate listening on 0.0.0.0:3200 (upstream: http://127.0.0.1:9901/v1/chat/completions)
