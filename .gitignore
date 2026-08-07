@@ -2,3 +2,4 @@ target/
 stargate.log
 cargo-fetch.log
 stargate-full.log
+*.log
