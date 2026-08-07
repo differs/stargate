@@ -15,6 +15,7 @@ mod auth;
 mod billing;
 #[cfg(test)]
 mod billing_tests;
+mod jwt;
 mod gateway;
 mod metering;
 mod openai;
@@ -114,11 +115,43 @@ async fn main() {
                 let mut pay_svc = pay_svc;
                 pay_svc.register_channel(Box::new(payment::MockChannel));
 
+                let jwt_secret = env_or("STARGATE_JWT_SECRET", "");
+                let jwt_mgr = if jwt_secret.is_empty() {
+                    None
+                } else {
+                    Some(crate::jwt::JwtManager::new(&jwt_secret))
+                };
+                let oidc_client = if let Ok(url) = env::var("STARGATE_OIDC_PROVIDER_URL") {
+                    match portal::OidcClient::new(
+                        &url,
+                        &env_or("STARGATE_OIDC_CLIENT_ID", ""),
+                        &env_or("STARGATE_OIDC_CLIENT_SECRET", ""),
+                        &env_or("STARGATE_OIDC_REDIRECT_URL", "http://localhost:3202/api/oidc/callback"),
+                    )
+                    .await
+                    {
+                        Ok(c) => Some(std::sync::Arc::new(c)),
+                        Err(e) => {
+                            tracing::error!("oidc init failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if jwt_mgr.is_some() {
+                    tracing::info!("session JWT enabled");
+                }
+                if oidc_client.is_some() {
+                    tracing::info!("oidc enabled");
+                }
                 let portal_state = std::sync::Arc::new(portal::PortalState {
                     auth: auth_svc.as_ref().clone(),
                     keys: ks.clone(),
                     pay: pay_svc,
                     admin_key: env_or("STARGATE_PORTAL_KEY", ""),
+                    jwt: jwt_mgr,
+                    oidc: oidc_client,
                 });
                 let app2 = portal::router(portal_state);
                 let portal_port = env_or("STARGATE_PORTAL_PORT", "3202");

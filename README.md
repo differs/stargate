@@ -159,6 +159,20 @@ Verified end-to-end: register → login → key → recharge → mock pay →
 consume with the new key → balance exact; duplicate callback no-ops
 (money safe). Mirrors MeterGate's commercial stack.
 
+## Sessions (JWT + OIDC)
+
+```bash
+STARGATE_JWT_SECRET=<32+ bytes> STARGATE_OIDC_PROVIDER_URL=https://accounts.google.com STARGATE_OIDC_CLIENT_ID=... STARGATE_OIDC_CLIENT_SECRET=... ./target/release/stargate
+```
+
+- Login returns a session JWT (HS256, 24h); portal endpoints accept the
+  JWT OR the admin key.
+- `GET /api/oidc/login` → redirect to the IdP; `/api/oidc/callback`
+  exchanges the code, verifies the id_token (JWKS via discovery),
+  auto-registers/resolves the local account and returns a session JWT.
+- Verified end-to-end: login → JWT → create key with JWT (no admin
+  key); forged JWT rejected 401.
+
 ## Observability
 
 `GET /metrics` (Prometheus text format): HTTP requests by status class,

@@ -20,6 +20,8 @@ bcrypt = "0.15"
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+jsonwebtoken = "9"
+openidconnect = { version = "3", features = ["reqwest"] }
 tokio-stream = "0.1"
 redis = { version = "0.27", features = ["tokio-comp", "aio", "connection-manager", "script"] }
 tokio-postgres = "0.7"
