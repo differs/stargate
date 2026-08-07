@@ -49,7 +49,6 @@ so multiple rounds were taken; the Rust lead was consistent in every round.
 | non-stream, 100 concurrent (round 2) | **78,571 req/s** | 44,177 req/s | **1.78x** |
 | non-stream, 500 concurrent | **81,236 req/s** | 51,047 req/s | **1.59x** |
 | streaming, 50 concurrent | 312 req/s | 313 req/s | ~1.0x (theoretical limit 322) |
-| memory (idle RSS) | 69.9 MB | **39.8 MB** | Go uses 43% less |
 
 ### Full billing stack (Redis pre-charge + PG settle), 100 concurrent, 3 rounds
 
@@ -62,8 +61,6 @@ so multiple rounds were taken; the Rust lead was consistent in every round.
 - Billing integrity after 4M orders: balance exact to the micro, frozen 0
   (both implementations shared the same Redis+PG concurrently — cross-
   implementation consistency verified)
-- Memory under full billing: **Rust 54.6 MB vs Go 140.4 MB** (Rust's
-  pooled runtime wins once the billing stack is attached)
 - ⚠️ The first Rust attempt serialized pre-charge behind one mutex
   (13K req/s, 2x slower than Go) — switching to a pooled
   ConnectionManager removed the lock and flipped the result. Same lesson
@@ -72,6 +69,26 @@ so multiple rounds were taken; the Rust lead was consistent in every round.
 - Full billing pipeline (Kafka event bus, ClickHouse details, routing,
   reconciliation) remains in MeterGate; Stargate covers the dual-track
   core.
+
+### Memory (controlled measurement, same lifecycle for both)
+
+| Config | cold start | after 30s @100c | 30s after load |
+|--------|-----------|-----------------|----------------|
+| Rust pure forwarding | **5.1 MB** | 37.7 MB | 37.7 MB |
+| Go pure forwarding | 14.9 MB | **33.1 MB** | 33.1 MB |
+| Rust full billing | **5.7 MB** | **37.1 MB** | **36.8 MB** |
+| Go full billing | 17.9 MB | 49.0 MB | 43.6 MB |
+
+- **Cold start: Rust ~3x leaner** (5-6 MB vs 15-18 MB — Go's runtime
+  initializes more eagerly).
+- **After load: comparable** — pure forwarding Go is slightly leaner
+  (33 vs 38 MB), full billing Rust is leaner (37 vs 49 MB). Go's GC
+  releases some memory after load (49 → 44 MB); Rust's allocator holds
+  its peak (steady ~37 MB).
+- ⚠️ Earlier published numbers (69.9 MB / 140.4 MB) were sampled at
+  different points in the load lifecycle and are NOT comparable — RSS
+  fluctuates with connection pools and buffers. The table above uses
+  identical measurement points.
 
 ### Takeaways
 
