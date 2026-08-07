@@ -103,6 +103,30 @@ so multiple rounds were taken; the Rust lead was consistent in every round.
    ClickHouse) lives in MeterGate and was verified exact under 22K req/s;
    Stargate is the data-plane comparison baseline.
 
+## Comprehensive performance matrix (Rust)
+
+Full matrix, all on the same 16-core shared dev machine (load ~30 from
+unrelated workloads — numbers fluctuate; every scenario ran twice and the
+Rust lead was consistent).
+
+| Scenario | Pure forwarding | Full billing (Redis pre-charge + PG settle) |
+|----------|----------------|---------------------------------------------|
+| non-stream, 100 concurrent | **51.8K-55.0K req/s** | **35.2K-35.9K req/s** |
+| non-stream, 500 concurrent | **74.1K req/s** | **46.9K req/s** |
+| streaming, 50 concurrent | 313 req/s (limit 322) | 314.5 req/s (limit 322) |
+| avg latency (100c) | 3.0ms | 3.0ms |
+
+Billing integrity after 3.55M orders in the full-billing run:
+balance exact to the micro, frozen 0.
+
+vs MeterGate (Go) under identical conditions:
+- pure forwarding 100c: Rust ~1.3-1.5x
+- full billing 100c: Rust ~1.3x (35-36K vs 26.8-27.7K)
+- streaming: identical (both at the theoretical limit)
+
+The billing stack costs Rust ~30% throughput (55K → 36K at 100c) —
+pre-charge RTT + settle pipeline — same ratio as Go's ~30% (44K → 27K).
+
 ## Accuracy parity with MeterGate
 
 Stargate syncs the accuracy-first fixes from the Go implementation:
