@@ -462,6 +462,104 @@ impl AuthService {
         Ok(row.get(0))
     }
 
+    /// Full org → team → project → user hierarchy with quotas (admin view).
+    pub async fn org_tree(&self) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let orgs = self
+            .client
+            .query(
+                "SELECT id, name, rpm_limit, tpm_limit FROM orgs ORDER BY id",
+                &[],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for o in orgs {
+            let oid: i64 = o.get(0);
+            let teams = self
+                .client
+                .query(
+                    "SELECT id, name, rpm_limit, tpm_limit FROM teams WHERE org_id=$1 ORDER BY id",
+                    &[&oid],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut teams_out = Vec::new();
+            for t in teams {
+                let tid: i64 = t.get(0);
+                let projects = self
+                    .client
+                    .query("SELECT id, name, rpm_limit, tpm_limit FROM projects WHERE team_id=$1 ORDER BY id", &[&tid])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut projs_out = Vec::new();
+                for p in projects {
+                    let pid: i64 = p.get(0);
+                    let users = self
+                        .client
+                        .query("SELECT id, username, rpm_limit, tpm_limit FROM users WHERE project_id=$1 ORDER BY id", &[&pid])
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    projs_out.push(json!({
+                        "id": pid,
+                        "name": p.get::<_, String>(1),
+                        "rpm_limit": p.get::<_, i64>(2),
+                        "tpm_limit": p.get::<_, i64>(3),
+                        "users": users.iter().map(|u| json!({
+                            "id": u.get::<_, i64>(0),
+                            "username": u.get::<_, String>(1),
+                            "rpm_limit": u.get::<_, i64>(2),
+                            "tpm_limit": u.get::<_, i64>(3),
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
+                teams_out.push(json!({
+                    "id": tid,
+                    "name": t.get::<_, String>(1),
+                    "rpm_limit": t.get::<_, i64>(2),
+                    "tpm_limit": t.get::<_, i64>(3),
+                    "projects": projs_out,
+                }));
+            }
+            out.push(json!({
+                "id": oid,
+                "name": o.get::<_, String>(1),
+                "rpm_limit": o.get::<_, i64>(2),
+                "tpm_limit": o.get::<_, i64>(3),
+                "teams": teams_out,
+            }));
+        }
+        Ok(serde_json::Value::Array(out))
+    }
+
+    /// Every configured aggregate quota (RPM/TPM > 0) for the monitor.
+    pub async fn quota_scopes(&self) -> Result<Vec<(String, i64, i64, i64)>, String> {
+        let mut out = Vec::new();
+        for (layer, table) in [
+            ("org", "orgs"),
+            ("team", "teams"),
+            ("project", "projects"),
+            ("user", "users"),
+        ] {
+            let rows = self
+                .client
+                .query(
+                    &format!("SELECT id, rpm_limit, tpm_limit FROM {table}"),
+                    &[],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            for r in rows {
+                let rpm: i64 = r.get(1);
+                let tpm: i64 = r.get(2);
+                if rpm > 0 || tpm > 0 {
+                    out.push((layer.to_string(), r.get(0), rpm, tpm));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Stored rate limits of a raw key (0 = unlimited).
     pub async fn resolve_limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
         let hash = key_hash(raw_key);

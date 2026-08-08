@@ -17,7 +17,7 @@ use crate::billing::{self, BillingHandle};
 use crate::metering::{self, Accumulator};
 use crate::openai::{self, ChatRequest};
 use crate::upstream::UpstreamClient;
-use prometheus::{Encoder, IntCounter, IntCounterVec, Opts, TextEncoder};
+use prometheus::{Encoder, GaugeVec, IntCounter, IntCounterVec, Opts, TextEncoder};
 use std::sync::LazyLock;
 use uuid::Uuid;
 
@@ -57,6 +57,18 @@ static RATE_LIMITED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Requests rejected by quota layer",
         &["layer"],
     )
+});
+static QUOTA_USAGE_RATIO: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let g = GaugeVec::new(
+        Opts::new(
+            "stargate_quota_usage_ratio",
+            "Sliding-window usage of a quota scope (0-1)",
+        ),
+        &["layer", "scope"],
+    )
+    .unwrap();
+    let _ = prometheus::register(Box::new(g.clone()));
+    g
 });
 
 /// Rate limiting hook: check quotas for one raw key. Ok(Some(guard)) =
@@ -146,6 +158,12 @@ pub fn record_http(code: u16) {
 
 pub fn record_precharge(result: &str) {
     PRECHARGE_TOTAL.with_label_values(&[result]).inc();
+}
+
+pub fn record_quota_usage(layer: &str, scope: &str, ratio: f64) {
+    QUOTA_USAGE_RATIO
+        .with_label_values(&[layer, scope])
+        .set(ratio);
 }
 
 pub fn record_rate_limited(layer: &str) {

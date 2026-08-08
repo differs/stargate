@@ -83,9 +83,11 @@ async fn main() {
 
     // --- P0 commercial: auth + payment + portal (requires PG) ---
     let mut key_store = None;
+    let mut auth_svc_ref: Option<std::sync::Arc<auth::AuthService>> = None;
     if !pg_dsn.is_empty() {
         match auth::AuthService::connect(&pg_dsn).await {
             Ok(auth_svc) => {
+                auth_svc_ref = Some(std::sync::Arc::new(auth_svc.clone()));
                 let auth_svc = std::sync::Arc::new(auth_svc);
                 let pay_redis_addr = redis_addr.clone();
                 let ks = std::sync::Arc::new(auth::CachedKeyStore::new(
@@ -200,6 +202,57 @@ async fn main() {
         },
         _ => None,
     };
+
+    // --- budget monitor: sample sliding-window usage of every configured
+    // quota scope into stargate_quota_usage_ratio (alerting input) ---
+    if let (Some(auth_svc), true) = (&auth_svc_ref, !redis_addr.is_empty()) {
+        let svc = auth_svc.clone();
+        let addr = redis_addr.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let Ok(scopes) = svc.quota_scopes().await else {
+                    continue;
+                };
+                let Ok(client) = redis::Client::open(format!("redis://{addr}")) else {
+                    continue;
+                };
+                let Ok(mut conn) = client.get_multiplexed_tokio_connection().await else {
+                    continue;
+                };
+                for (layer, id, rpm, tpm) in scopes {
+                    let scope = format!("{layer}-{id}");
+                    if rpm > 0 {
+                        if let Ok(count) = redis::cmd("ZCARD")
+                            .arg(format!("rl:{scope}:rpm"))
+                            .query_async::<i64>(&mut conn)
+                            .await
+                        {
+                            gateway::record_quota_usage(
+                                &layer,
+                                &scope,
+                                (count as f64 / rpm as f64).min(1.0),
+                            );
+                        }
+                    }
+                    if tpm > 0 {
+                        if let Ok(count) = redis::cmd("ZCARD")
+                            .arg(format!("rl:{scope}:tpm"))
+                            .query_async::<i64>(&mut conn)
+                            .await
+                        {
+                            gateway::record_quota_usage(
+                                &layer,
+                                &scope,
+                                (count as f64 / tpm as f64).min(1.0),
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let app = gateway::router_full(cfg, billing, key_store, limiter);
     let addr = format!("0.0.0.0:{port}");

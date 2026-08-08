@@ -131,6 +131,7 @@ pub fn router(state: Arc<PortalState>) -> Router {
             "/api/admin/projects/{id}/team",
             axum::routing::put(set_project_team),
         )
+        .route("/api/admin/tree", axum::routing::get(org_tree))
         .route("/api/admin/orgs", axum::routing::post(create_org))
         .route(
             "/api/admin/orgs/{id}/limits",
@@ -369,6 +370,21 @@ async fn set_project_team(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Full hierarchy with quotas (admin view for the management UI).
+async fn org_tree(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    match st.auth.org_tree().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("query failed: {e}")}})),
         )
             .into_response(),
     }
