@@ -61,7 +61,8 @@ static RATE_LIMITED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Rate limiting hook: check quotas for one raw key. Ok(Some(guard)) =
 /// hold the guard (drops the in-flight slot on request end); Ok(None) =
-/// pass without a slot; Err(retry_after) = over a limit.
+/// pass without a slot; Err(QuotaExceeded) = over a limit (layer +
+/// retry-after).
 pub trait RateLimiter: Send + Sync {
     fn allow<'a>(
         &'a self,
@@ -70,7 +71,10 @@ pub trait RateLimiter: Send + Sync {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<Option<crate::ratelimit::ConcurrencyGuard>, u64>,
+                    Output = Result<
+                        Option<crate::ratelimit::ConcurrencyGuard>,
+                        crate::ratelimit::QuotaExceeded,
+                    >,
                 > + Send
                 + '_,
         >,
@@ -231,12 +235,12 @@ async fn handle_chat(
     if let Some(limiter) = &state.limiter {
         match limiter.allow(&raw_key, prompt_tokens).await {
             Ok(guard) => _rate_guard = guard,
-            Err(retry_after) => {
+            Err(exceeded) => {
                 record_http(429);
-                record_rate_limited("key");
+                record_rate_limited(exceeded.layer);
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
-                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    [(header::RETRY_AFTER, exceeded.retry_after.to_string())],
                     Json(serde_json::json!({
                         "error": {"message": "rate limit exceeded", "type": "stargate_error"}
                     })),

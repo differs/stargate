@@ -113,7 +113,11 @@ pub fn router(state: Arc<PortalState>) -> Router {
         .route("/api/recharge/status", axum::routing::get(recharge_status))
         .route("/api/oidc/login", axum::routing::get(oidc_login))
         .route("/api/oidc/callback", axum::routing::get(oidc_callback))
-        .route("/api/balance", axum::routing::get(balance));
+        .route("/api/balance", axum::routing::get(balance))
+        .route(
+            "/api/admin/users/{id}/limits",
+            axum::routing::put(set_user_limits),
+        );
     if let Some(dir) = &state.web_dir {
         app = app.fallback_service(tower_http::services::ServeDir::new(dir));
     }
@@ -278,6 +282,48 @@ async fn balance(State(st): State<Arc<PortalState>>, headers: axum::http::Header
 struct CredReq {
     username: String,
     password: String,
+}
+
+/// Admin-only: update a user's aggregate quota (layer 2 of the
+/// six-layer budget model). The admin key is required — session JWTs
+/// are NOT accepted for platform policy changes.
+async fn set_user_limits(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(user_id): axum::extract::Path<i64>,
+    Json(req): Json<SetLimitsReq>,
+) -> Response {
+    let admin_ok = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|auth| auth.strip_prefix("Bearer ").unwrap_or("") == st.admin_key)
+        .unwrap_or(false);
+    if !admin_ok {
+        return unauthorized();
+    }
+    match st
+        .auth
+        .set_user_limits(user_id, req.rpm_limit, req.tpm_limit)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "user_id": user_id,
+            "rpm_limit": req.rpm_limit,
+            "tpm_limit": req.tpm_limit,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetLimitsReq {
+    rpm_limit: u64,
+    tpm_limit: u64,
 }
 
 async fn register(

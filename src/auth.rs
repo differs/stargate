@@ -161,6 +161,42 @@ impl AuthService {
         Ok(key)
     }
 
+    /// User-level aggregate quota (0 = unlimited) — layer 2 of the
+    /// six-layer budget model: all keys of a user share this budget.
+    pub async fn resolve_user_limits(
+        &self,
+        user_id: i64,
+    ) -> Result<crate::ratelimit::Limits, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT rpm_limit, tpm_limit FROM users WHERE id=$1",
+                &[&user_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("user not found".into());
+        };
+        Ok(crate::ratelimit::Limits {
+            rpm: row.get::<_, i64>(0).max(0) as u64,
+            tpm: row.get::<_, i64>(1).max(0) as u64,
+            concurrency: 0,
+        })
+    }
+
+    /// Update a user's aggregate quota (admin operation).
+    pub async fn set_user_limits(&self, user_id: i64, rpm: u64, tpm: u64) -> Result<(), String> {
+        self.client
+            .execute(
+                "UPDATE users SET rpm_limit=$2, tpm_limit=$3 WHERE id=$1",
+                &[&user_id, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Stored rate limits of a raw key (0 = unlimited).
     pub async fn resolve_limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
         let hash = key_hash(raw_key);
@@ -248,6 +284,8 @@ pub struct CachedKeyStore {
     svc: AuthService,
     ttl: Duration,
     cache: Mutex<std::collections::HashMap<String, (i64, Instant)>>,
+    limits_cache: Mutex<std::collections::HashMap<String, (crate::ratelimit::Limits, Instant)>>,
+    user_limits_cache: Mutex<std::collections::HashMap<i64, (crate::ratelimit::Limits, Instant)>>,
 }
 
 impl CachedKeyStore {
@@ -256,13 +294,48 @@ impl CachedKeyStore {
             svc,
             ttl,
             cache: Mutex::new(Default::default()),
+            limits_cache: Mutex::new(Default::default()),
+            user_limits_cache: Mutex::new(Default::default()),
         }
     }
 
-    /// Stored limits with cache (negative entries cached shorter).
+    /// Stored limits with cache (unknown keys fast-fail via resolve).
     pub async fn limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
         self.resolve(raw_key).await?; // fast-fail on unknown keys
-        Ok(self.svc.resolve_limits(raw_key).await.unwrap_or_default())
+        let now = Instant::now();
+        {
+            let cache = self.limits_cache.lock().unwrap();
+            if let Some((l, at)) = cache.get(raw_key) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*l);
+                }
+            }
+        }
+        let l = self.svc.resolve_limits(raw_key).await?;
+        self.limits_cache
+            .lock()
+            .unwrap()
+            .insert(raw_key.to_string(), (l, now));
+        Ok(l)
+    }
+
+    /// User-level aggregate quota with cache.
+    pub async fn user_limits(&self, user_id: i64) -> Result<crate::ratelimit::Limits, String> {
+        let now = Instant::now();
+        {
+            let cache = self.user_limits_cache.lock().unwrap();
+            if let Some((l, at)) = cache.get(&user_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*l);
+                }
+            }
+        }
+        let l = self.svc.resolve_user_limits(user_id).await?;
+        self.user_limits_cache
+            .lock()
+            .unwrap()
+            .insert(user_id, (l, now));
+        Ok(l)
     }
 
     /// Resolve with cache (negative entries cached shorter).
@@ -312,21 +385,14 @@ mod tests {
         let svc = AuthService {
             client: Arc::new(client),
         };
-        // NOTE: extended-protocol execute cannot run multiple statements;
-        // DROP + rebuild must use batch_execute (same as connect does).
-        svc.client
-            .batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users")
-            .await
-            .unwrap();
-        svc.client
-            .batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users CASCADE")
-            .await
-            .unwrap();
+        // Idempotent schema (never DROP: tests share the DB and run in
+        // parallel — a DROP would race other tests' tables).
         svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
-        let _ = svc.register("ckprobe", "password123").await;
+        let username = format!("ckprobe-{}", std::process::id());
+        let uid = svc.register(&username, "password123").await.unwrap();
         let key = svc
             .create_key(
-                1,
+                uid,
                 "probe",
                 crate::ratelimit::Limits {
                     rpm: 3,
@@ -353,5 +419,39 @@ mod tests {
             }
             Err(e) => eprintln!("create_key FAILED: {e}"),
         }
+    }
+
+    /// User-level aggregate quota roundtrip (layer 2).
+    #[tokio::test]
+    async fn user_limits_roundtrip() {
+        let Ok(dsn) = std::env::var("STARGATE_TEST_PG") else {
+            eprintln!("skipping: STARGATE_TEST_PG not set");
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
+            .await
+            .expect("pg connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let svc = AuthService {
+            client: Arc::new(client),
+        };
+        svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
+        let username = format!("limits-probe-{}", std::process::id());
+        let _ = svc.register(&username, "password123").await;
+        let uid = svc.login(&username, "password123").await.expect("login");
+
+        // default: unlimited
+        let l = svc.resolve_user_limits(uid).await.expect("resolve default");
+        assert_eq!(l.rpm, 0, "new user must be unlimited");
+        assert_eq!(l.tpm, 0, "new user must be unlimited");
+
+        // set aggregate budget and read back
+        svc.set_user_limits(uid, 5, 1000).await.expect("set limits");
+        let l = svc.resolve_user_limits(uid).await.expect("resolve set");
+        assert_eq!(l.rpm, 5);
+        assert_eq!(l.tpm, 1000);
+        println!("user_limits OK: rpm={} tpm={} (uid={uid})", l.rpm, l.tpm);
     }
 }

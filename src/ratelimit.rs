@@ -25,6 +25,13 @@ pub struct Limits {
 /// Sliding-window length.
 const WINDOW_MS: u64 = 60_000;
 
+/// Quota rejection: which layer refused the request and the retry-after.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaExceeded {
+    pub retry_after: u64,
+    pub layer: &'static str, // "key" | "user" (six-layer budget model)
+}
+
 /// Retry-After we advertise on 429 (safe estimate of the window slide).
 const RETRY_AFTER_S: u64 = 30;
 
@@ -197,32 +204,74 @@ impl KeyLimiter {
         Self { check, keys }
     }
 
-    /// Check RPM → TPM → concurrency for one raw key.
+    /// Check the key layer (RPM → TPM → concurrency) then the user
+    /// aggregate layer (RPM → TPM, scope `user-{id}`, shared by all keys
+    /// of a user).
     /// Ok(Some(guard)) = hold the guard until the request finishes;
-    /// Ok(None) = unlimited or no concurrency slot needed.
-    /// Err(retry_after) = over a limit.
+    /// Ok(None) = unlimited or no concurrency slot needed;
+    /// Err(QuotaExceeded) = over a limit (layer + retry-after).
     pub async fn check(
         &self,
         raw_key: &str,
         prompt_tokens: u32,
-    ) -> Result<Option<ConcurrencyGuard>, u64> {
+    ) -> Result<Option<ConcurrencyGuard>, QuotaExceeded> {
+        let layer = |r: u64| QuotaExceeded {
+            retry_after: r,
+            layer: "key",
+        };
+
+        // --- Layer 1: per-key limits (cached) ---
         let limits = self.keys.limits(raw_key).await.ok().unwrap_or_default();
-        if limits.rpm == 0 && limits.tpm == 0 && limits.concurrency == 0 {
-            return Ok(None);
+        if limits.rpm > 0 {
+            self.check
+                .check_rpm(raw_key, limits.rpm)
+                .await
+                .map_err(layer)?;
         }
-        self.check.check_rpm(raw_key, limits.rpm).await?;
-        // Estimate completion tokens (capped) — same policy as the Go port.
-        self.check
-            .check_tpm(raw_key, limits.tpm, prompt_tokens as u64 + 1000)
-            .await?;
+        if limits.tpm > 0 {
+            // Estimate completion tokens (capped) — same policy as Go.
+            self.check
+                .check_tpm(raw_key, limits.tpm, prompt_tokens as u64 + 1000)
+                .await
+                .map_err(layer)?;
+        }
         if limits.concurrency > 0 {
             match self.check.acquire(raw_key, limits.concurrency).await {
-                Some(g) => Ok(Some(g)),
-                None => Err(0),
+                Some(g) => return Ok(Some(g)),
+                None => {
+                    return Err(QuotaExceeded {
+                        retry_after: 0,
+                        layer: "key",
+                    });
+                }
             }
-        } else {
-            Ok(None)
         }
+
+        // --- Layer 2: user-level aggregate budget (shared across keys) ---
+        if let Ok(uid) = self.keys.resolve(raw_key).await {
+            if let Ok(ul) = self.keys.user_limits(uid).await {
+                let user_layer = |r: u64| QuotaExceeded {
+                    retry_after: r,
+                    layer: "user",
+                };
+                if ul.rpm > 0 || ul.tpm > 0 {
+                    let scope = format!("user-{uid}");
+                    if ul.rpm > 0 {
+                        self.check
+                            .check_rpm(&scope, ul.rpm)
+                            .await
+                            .map_err(user_layer)?;
+                    }
+                    if ul.tpm > 0 {
+                        self.check
+                            .check_tpm(&scope, ul.tpm, prompt_tokens as u64 + 1000)
+                            .await
+                            .map_err(user_layer)?;
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -232,7 +281,11 @@ impl crate::gateway::RateLimiter for KeyLimiter {
         raw_key: &'a str,
         prompt_tokens: u32,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<ConcurrencyGuard>, u64>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<Option<ConcurrencyGuard>, QuotaExceeded>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(async move { self.check(raw_key, prompt_tokens).await })
     }
