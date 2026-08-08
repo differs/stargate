@@ -51,7 +51,16 @@ impl UpstreamClient {
     }
 
     /// Streaming forward: returns the byte stream of the upstream body.
-    pub async fn forward_stream(&self, body: Bytes) -> Result<(u16, impl tokio_stream::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static), String> {
+    pub async fn forward_stream(
+        &self,
+        body: Bytes,
+    ) -> Result<
+        (
+            u16,
+            impl tokio_stream::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        ),
+        String,
+    > {
         let resp = self
             .inner
             .post(self.url.as_str())

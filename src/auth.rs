@@ -65,12 +65,19 @@ CREATE TABLE IF NOT EXISTS payments (
 impl AuthService {
     /// Connect and apply the commercial schema.
     pub async fn connect(dsn: &str) -> Result<Self, String> {
-        let (client, conn) = tokio_postgres::connect(dsn, NoTls).await.map_err(|e| e.to_string())?;
+        let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+            .await
+            .map_err(|e| e.to_string())?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        client.batch_execute(COMMERCIAL_SCHEMA).await.map_err(|e| e.to_string())?;
-        Ok(Self { client: Arc::new(client) })
+        client
+            .batch_execute(COMMERCIAL_SCHEMA)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            client: Arc::new(client),
+        })
     }
 
     pub fn client(&self) -> &tokio_postgres::Client {
@@ -112,7 +119,9 @@ impl AuthService {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let Some(row) = row else { return Err("invalid username or password".into()) };
+        let Some(row) = row else {
+            return Err("invalid username or password".into());
+        };
         let status: i16 = row.get(1);
         if status != 1 {
             return Err("user disabled".into());
@@ -163,7 +172,9 @@ impl AuthService {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let Some(row) = row else { return Err("key not found".into()) };
+        let Some(row) = row else {
+            return Err("key not found".into());
+        };
         Ok(crate::ratelimit::Limits {
             rpm: row.get::<_, i64>(0).max(0) as u64,
             tpm: row.get::<_, i64>(1).max(0) as u64,
@@ -183,7 +194,13 @@ impl AuthService {
             .map_err(|e| e.to_string())?;
         Ok(rows
             .iter()
-            .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1), r.get::<_, i16>(2)))
+            .map(|r| {
+                (
+                    r.get::<_, i64>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, i16>(2),
+                )
+            })
             .collect())
     }
 
@@ -198,7 +215,9 @@ impl AuthService {
             )
             .await
             .map_err(|e| e.to_string())?;
-        let Some(row) = row else { return Err("key not found".into()) };
+        let Some(row) = row else {
+            return Err("key not found".into());
+        };
         let status: i16 = row.get(1);
         if status != 1 {
             return Err("key not found".into());
@@ -233,7 +252,11 @@ pub struct CachedKeyStore {
 
 impl CachedKeyStore {
     pub fn new(svc: AuthService, ttl: Duration) -> Self {
-        Self { svc, ttl, cache: Mutex::new(Default::default()) }
+        Self {
+            svc,
+            ttl,
+            cache: Mutex::new(Default::default()),
+        }
     }
 
     /// Stored limits with cache (negative entries cached shorter).
@@ -270,8 +293,6 @@ impl CachedKeyStore {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,24 +303,53 @@ mod tests {
             eprintln!("skipping: STARGATE_TEST_PG not set");
             return;
         };
-        let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await.expect("pg connect");
-        tokio::spawn(async move { let _ = conn.await; });
-        let svc = AuthService { client: Arc::new(client) };
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
+            .await
+            .expect("pg connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let svc = AuthService {
+            client: Arc::new(client),
+        };
         // NOTE: extended-protocol execute cannot run multiple statements;
         // DROP + rebuild must use batch_execute (same as connect does).
         svc.client
             .batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users")
             .await
             .unwrap();
-        svc.client.batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users CASCADE").await.unwrap();
+        svc.client
+            .batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users CASCADE")
+            .await
+            .unwrap();
         svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
         let _ = svc.register("ckprobe", "password123").await;
-        let key = svc.create_key(1, "probe", crate::ratelimit::Limits { rpm: 3, tpm: 100, concurrency: 2 }).await;
+        let key = svc
+            .create_key(
+                1,
+                "probe",
+                crate::ratelimit::Limits {
+                    rpm: 3,
+                    tpm: 100,
+                    concurrency: 2,
+                },
+            )
+            .await;
         match key {
             Ok(k) => {
                 let l = svc.resolve_limits(&k).await.expect("resolve limits");
-                assert_eq!(l, crate::ratelimit::Limits { rpm: 3, tpm: 100, concurrency: 2 });
-                println!("create_key OK: rpm={} tpm={} concurrency={}", l.rpm, l.tpm, l.concurrency);
+                assert_eq!(
+                    l,
+                    crate::ratelimit::Limits {
+                        rpm: 3,
+                        tpm: 100,
+                        concurrency: 2
+                    }
+                );
+                println!(
+                    "create_key OK: rpm={} tpm={} concurrency={}",
+                    l.rpm, l.tpm, l.concurrency
+                );
             }
             Err(e) => eprintln!("create_key FAILED: {e}"),
         }

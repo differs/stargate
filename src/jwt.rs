@@ -1,6 +1,6 @@
 //! JWT session tokens (HS256) — Rust port of MeterGate's auth.JWTManager.
 
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Claims {
@@ -18,7 +18,9 @@ pub struct JwtManager {
 
 impl JwtManager {
     pub fn new(secret: &str) -> Self {
-        Self { secret: secret.to_string() }
+        Self {
+            secret: secret.to_string(),
+        }
     }
 
     /// Sign a session token (24h TTL).

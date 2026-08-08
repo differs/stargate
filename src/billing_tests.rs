@@ -2,7 +2,7 @@
 //! request-start price snapshots, capped pre-charge, dedupe logic.
 
 use crate::billing::{
-    calculate_amount, estimate_precharge, order_from_event, price_for, MeteringEvent, ModelPrice,
+    MeteringEvent, ModelPrice, calculate_amount, estimate_precharge, order_from_event, price_for,
 };
 
 fn ev(rid: &str) -> MeteringEvent {
@@ -24,7 +24,10 @@ fn ev(rid: &str) -> MeteringEvent {
 fn order_uses_request_start_snapshot() {
     let mut e = ev("req-snap");
     // Request started at $10/1M output...
-    e.pricing = Some(ModelPrice { input_per_1m: 2_000_000, output_per_1m: 10_000_000 });
+    e.pricing = Some(ModelPrice {
+        input_per_1m: 2_000_000,
+        output_per_1m: 10_000_000,
+    });
     // ...price table has since changed to $8 (simulated by constructing
     // the order with the snapshot present — table is irrelevant).
     let o = order_from_event(&e);
@@ -48,13 +51,19 @@ fn failed_requests_are_free() {
     e.completion_tokens = 500; // would have billed if not failed
     let o = order_from_event(&e);
     assert_eq!(o.status, "NO_CHARGE");
-    assert_eq!(o.amount_micros, 0, "zero-completion insurance: failed = free");
+    assert_eq!(
+        o.amount_micros, 0,
+        "zero-completion insurance: failed = free"
+    );
     assert_eq!(o.completion_tokens, 0);
 }
 
 #[test]
 fn precharge_cap_applies() {
-    let p = ModelPrice { input_per_1m: 2_000_000, output_per_1m: 10_000_000 };
+    let p = ModelPrice {
+        input_per_1m: 2_000_000,
+        output_per_1m: 10_000_000,
+    };
     // max_tokens = 1_000_000 → capped at 16_000 completion
     let est = estimate_precharge(1000, Some(1_000_000), p);
     // (1000*2 + 16000*10)/1e6 * 1.1 ≈ 178,200; must not scale with 1M tokens
@@ -67,11 +76,18 @@ fn precharge_cap_applies() {
 #[test]
 fn shard_index_stable() {
     // same key → same shard (ordering/dedupe within a shard depends on it)
-    assert_eq!(crate::billing::shard_index("req-x", 8), crate::billing::shard_index("req-x", 8));
+    assert_eq!(
+        crate::billing::shard_index("req-x", 8),
+        crate::billing::shard_index("req-x", 8)
+    );
     // different keys spread (fnv distribution sanity)
     let mut seen = std::collections::HashSet::new();
     for i in 0..1000 {
         seen.insert(crate::billing::shard_index(&format!("req-{i}"), 8));
     }
-    assert!(seen.len() >= 6, "hash should spread across shards, got {}", seen.len());
+    assert!(
+        seen.len() >= 6,
+        "hash should spread across shards, got {}",
+        seen.len()
+    );
 }

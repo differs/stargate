@@ -15,13 +15,13 @@ mod auth;
 mod billing;
 #[cfg(test)]
 mod billing_tests;
-mod jwt;
 mod gateway;
+mod jwt;
 mod metering;
 mod openai;
 mod payment;
-mod ratelimit;
 mod portal;
+mod ratelimit;
 mod upstream;
 
 use std::env;
@@ -128,7 +128,10 @@ async fn main() {
                         &url,
                         &env_or("STARGATE_OIDC_CLIENT_ID", ""),
                         &env_or("STARGATE_OIDC_CLIENT_SECRET", ""),
-                        &env_or("STARGATE_OIDC_REDIRECT_URL", "http://localhost:3202/api/oidc/callback"),
+                        &env_or(
+                            "STARGATE_OIDC_REDIRECT_URL",
+                            "http://localhost:3202/api/oidc/callback",
+                        ),
                     )
                     .await
                     {
@@ -161,9 +164,10 @@ async fn main() {
                 });
                 let app2 = portal::router(portal_state);
                 let portal_port = env_or("STARGATE_PORTAL_PORT", "3202");
-                let portal_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{portal_port}"))
-                    .await
-                    .expect("portal bind");
+                let portal_listener =
+                    tokio::net::TcpListener::bind(format!("0.0.0.0:{portal_port}"))
+                        .await
+                        .expect("portal bind");
                 tokio::spawn(async move {
                     tracing::info!("stargate portal listening on :{portal_port}");
                     let _ = axum::serve(portal_listener, app2).await;
@@ -179,11 +183,15 @@ async fn main() {
     }
 
     // --- rate limiting (per-key RPM/TPM/concurrency) ---
-    let limiter: Option<Arc<dyn gateway::RateLimiter>> = match (&key_store, !redis_addr.is_empty()) {
+    let limiter: Option<Arc<dyn gateway::RateLimiter>> = match (&key_store, !redis_addr.is_empty())
+    {
         (Some(ks), true) => match crate::ratelimit::Checker::connect(&redis_addr).await {
             Ok(check) => {
                 tracing::info!("rate limiting enabled (RPM/TPM/concurrency per key)");
-                Some(Arc::new(crate::ratelimit::KeyLimiter::new(check, ks.clone())))
+                Some(Arc::new(crate::ratelimit::KeyLimiter::new(
+                    check,
+                    ks.clone(),
+                )))
             }
             Err(e) => {
                 tracing::error!("rate limiter init failed, running without: {e}");
@@ -205,7 +213,9 @@ async fn init_billing(redis_addr: &str, pg_dsn: &str) -> Result<billing::Billing
     let pre = billing::Precharger::connect(redis_addr).await?;
     let settler = std::sync::Arc::new(billing::Settler::new(store.clone(), Some(pre), 500).await);
     Ok(billing::BillingHandle {
-        pre: Some(std::sync::Arc::new(billing::Precharger::connect(redis_addr).await?)),
+        pre: Some(std::sync::Arc::new(
+            billing::Precharger::connect(redis_addr).await?,
+        )),
         settler,
         store,
     })

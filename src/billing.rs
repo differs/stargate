@@ -15,7 +15,7 @@ use std::time::Duration;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 
 use redis::AsyncCommands;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_postgres::NoTls;
 
 // ---------------------------------------------------------------------------
@@ -30,10 +30,22 @@ pub struct ModelPrice {
 
 pub fn price_for(model: &str) -> ModelPrice {
     match model {
-        "gpt-4o" => ModelPrice { input_per_1m: 2_500_000, output_per_1m: 10_000_000 },
-        "gpt-4o-mini" => ModelPrice { input_per_1m: 150_000, output_per_1m: 600_000 },
-        "deepseek-chat" => ModelPrice { input_per_1m: 270_000, output_per_1m: 1_100_000 },
-        _ => ModelPrice { input_per_1m: 1_000_000, output_per_1m: 2_000_000 },
+        "gpt-4o" => ModelPrice {
+            input_per_1m: 2_500_000,
+            output_per_1m: 10_000_000,
+        },
+        "gpt-4o-mini" => ModelPrice {
+            input_per_1m: 150_000,
+            output_per_1m: 600_000,
+        },
+        "deepseek-chat" => ModelPrice {
+            input_per_1m: 270_000,
+            output_per_1m: 1_100_000,
+        },
+        _ => ModelPrice {
+            input_per_1m: 1_000_000,
+            output_per_1m: 2_000_000,
+        },
     }
 }
 
@@ -57,9 +69,15 @@ pub fn estimate_precharge(prompt: i64, max_tokens: Option<u32>, p: ModelPrice) -
 // Redis keys + Lua scripts (byte-identical semantics to MeterGate)
 // ---------------------------------------------------------------------------
 
-fn bal_key(user: &str) -> String { format!("balance:{user}") }
-fn frozen_key(user: &str) -> String { format!("frozen:{user}") }
-fn pre_key(req: &str) -> String { format!("precharge:{req}") }
+fn bal_key(user: &str) -> String {
+    format!("balance:{user}")
+}
+fn frozen_key(user: &str) -> String {
+    format!("frozen:{user}")
+}
+fn pre_key(req: &str) -> String {
+    format!("precharge:{req}")
+}
 
 const PRECHARGE_SCRIPT: &str = r#"
 local bal = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -98,7 +116,9 @@ pub struct Precharger {
 impl Precharger {
     pub async fn connect(addr: &str) -> Result<Self, String> {
         let client = redis::Client::open(format!("redis://{addr}")).map_err(|e| e.to_string())?;
-        let conn = redis::aio::ConnectionManager::new(client).await.map_err(|e| e.to_string())?;
+        let conn = redis::aio::ConnectionManager::new(client)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Self { conn })
     }
 
@@ -112,12 +132,7 @@ impl Precharger {
     }
 
     /// Atomic pre-charge; Err("insufficient") when balance cannot cover.
-    pub async fn precharge(
-        &self,
-        user: &str,
-        request_id: &str,
-        amount: i64,
-    ) -> Result<(), String> {
+    pub async fn precharge(&self, user: &str, request_id: &str, amount: i64) -> Result<(), String> {
         if amount <= 0 {
             return Ok(());
         }
@@ -147,7 +162,11 @@ impl Precharger {
     ) -> Result<(), String> {
         let mut pipe = redis::pipe();
         for (o, ev) in orders.iter().zip(events.iter()) {
-            let charged = if o.status == "NO_CHARGE" { 0 } else { o.amount_micros };
+            let charged = if o.status == "NO_CHARGE" {
+                0
+            } else {
+                o.amount_micros
+            };
             pipe.cmd("EVAL")
                 .arg(SETTLE_SCRIPT)
                 .arg(3usize)
@@ -223,13 +242,25 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub async fn connect(dsn: &str) -> Result<Self, String> {
-        let cfg: tokio_postgres::Config = dsn.parse().map_err(|e: tokio_postgres::error::Error| e.to_string())?;
-        let mgr = Manager::from_config(cfg, NoTls, ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        });
-        let pool = Pool::builder(mgr).max_size(16).build().map_err(|e| e.to_string())?;
+        let cfg: tokio_postgres::Config = dsn
+            .parse()
+            .map_err(|e: tokio_postgres::error::Error| e.to_string())?;
+        let mgr = Manager::from_config(
+            cfg,
+            NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        let pool = Pool::builder(mgr)
+            .max_size(16)
+            .build()
+            .map_err(|e| e.to_string())?;
         let client = pool.get().await.map_err(|e| e.to_string())?;
-        client.batch_execute(SCHEMA).await.map_err(|e| e.to_string())?;
+        client
+            .batch_execute(SCHEMA)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Self { pool })
     }
 
@@ -246,7 +277,8 @@ impl PostgresStore {
             "INSERT INTO orders (request_id, user_id, model, provider, status, prompt_tokens, \
              completion_tokens, total_tokens, amount_micros, duration_ms, ttft_ms) VALUES ",
         );
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::with_capacity(orders.len() * COLS);
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            Vec::with_capacity(orders.len() * COLS);
         for (i, o) in orders.iter().enumerate() {
             if i > 0 {
                 sql.push(',');
@@ -254,8 +286,17 @@ impl PostgresStore {
             let base = i * COLS;
             sql.push_str(&format!(
                 "(${},${},${},${},${},${},${},${},${},${},${})",
-                base + 1, base + 2, base + 3, base + 4, base + 5, base + 6,
-                base + 7, base + 8, base + 9, base + 10, base + 11
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9,
+                base + 10,
+                base + 11
             ));
             params.push(Box::new(o.request_id.clone()));
             params.push(Box::new(o.user_id.clone()));
@@ -347,11 +388,7 @@ pub(crate) fn shard_index(key: &str, n: usize) -> usize {
 }
 
 impl Settler {
-    pub async fn new(
-        store: Arc<PostgresStore>,
-        pre: Option<Precharger>,
-        batch: usize,
-    ) -> Self {
+    pub async fn new(store: Arc<PostgresStore>, pre: Option<Precharger>, batch: usize) -> Self {
         let n = 8usize;
         let pre_shared = pre.map(Arc::new);
         let mut shards = Vec::with_capacity(n);
@@ -377,7 +414,12 @@ impl Settler {
             });
             shards.push(sh);
         }
-        Self { store, pre: pre_shared, batch, shards }
+        Self {
+            store,
+            pre: pre_shared,
+            batch,
+            shards,
+        }
     }
 
     /// Buffer one event (non-blocking). Drops when full (shard buffer
@@ -401,8 +443,16 @@ impl Settler {
 }
 
 pub(crate) fn order_from_event(ev: &MeteringEvent) -> Order {
-    let status = if ev.status == "failed" { "NO_CHARGE" } else { "SETTLED" };
-    let completion = if ev.status == "failed" { 0 } else { ev.completion_tokens };
+    let status = if ev.status == "failed" {
+        "NO_CHARGE"
+    } else {
+        "SETTLED"
+    };
+    let completion = if ev.status == "failed" {
+        0
+    } else {
+        ev.completion_tokens
+    };
     // Price from the REQUEST-START snapshot; fall back to the current
     // table only for legacy events without a snapshot.
     let p = ev.pricing.unwrap_or_else(|| price_for(&ev.model));
@@ -426,11 +476,7 @@ pub(crate) fn order_from_event(ev: &MeteringEvent) -> Order {
     }
 }
 
-async fn flush_shard(
-    sh: &Shard,
-    store: &PostgresStore,
-    pre: Option<&Arc<Precharger>>,
-) {
+async fn flush_shard(sh: &Shard, store: &PostgresStore, pre: Option<&Arc<Precharger>>) {
     let (orders, events) = {
         let mut guard = sh.buf.lock().await;
         if guard.0.is_empty() {

@@ -14,7 +14,9 @@ use serde_json::json;
 
 use crate::auth::{AuthService, CachedKeyStore};
 use crate::payment::PaymentService;
-use openidconnect::core::{CoreClient, CoreIdTokenVerifier, CoreProviderMetadata, CoreResponseType};
+use openidconnect::core::{
+    CoreClient, CoreIdTokenVerifier, CoreProviderMetadata, CoreResponseType,
+};
 use openidconnect::{ClientId, ClientSecret, IssuerUrl, RedirectUrl};
 
 pub struct PortalState {
@@ -37,7 +39,12 @@ pub struct OidcClient {
 }
 
 impl OidcClient {
-    pub async fn new(provider_url: &str, client_id: &str, client_secret: &str, redirect: &str) -> Result<Self, String> {
+    pub async fn new(
+        provider_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        redirect: &str,
+    ) -> Result<Self, String> {
         let meta = CoreProviderMetadata::discover_async(
             IssuerUrl::new(provider_url.to_string()).map_err(|e| e.to_string())?,
             openidconnect::reqwest::async_http_client,
@@ -50,7 +57,10 @@ impl OidcClient {
             Some(ClientSecret::new(client_secret.to_string())),
         )
         .set_redirect_uri(RedirectUrl::new(redirect.to_string()).map_err(|e| e.to_string())?);
-        Ok(Self { client, redirect: redirect.to_string() })
+        Ok(Self {
+            client,
+            redirect: redirect.to_string(),
+        })
     }
 
     /// Build the IdP authorization URL (state = CSRF).
@@ -127,7 +137,11 @@ async fn admin_auth(state: &PortalState, headers: &axum::http::HeaderMap) -> boo
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
 }
 
 fn user_id_from(headers: &axum::http::HeaderMap, q: &axum::http::Uri) -> Result<i64, Response> {
@@ -142,13 +156,22 @@ fn user_id_from(headers: &axum::http::HeaderMap, q: &axum::http::Uri) -> Result<
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
     });
-    raw.and_then(|s| s.parse::<i64>().ok())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": "user_id required"}))).into_response())
+    raw.and_then(|s| s.parse::<i64>().ok()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "user_id required"})),
+        )
+            .into_response()
+    })
 }
 
 async fn oidc_login(State(st): State<Arc<PortalState>>) -> Response {
     let Some(oidc) = &st.oidc else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "oidc disabled"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "oidc disabled"})),
+        )
+            .into_response();
     };
     let state_str = format!("{:x}", rand::random::<u64>());
     let url = oidc.auth_url(state_str);
@@ -160,11 +183,21 @@ async fn oidc_callback(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(oidc) = &st.oidc else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "oidc disabled"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "oidc disabled"})),
+        )
+            .into_response();
     };
     let code = match params.get("code") {
         Some(c) => c.clone(),
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing code"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing code"})),
+            )
+                .into_response();
+        }
     };
     match oidc.exchange(&code).await {
         Ok((subject, email)) => {
@@ -186,7 +219,11 @@ async fn oidc_callback(
         }
         Err(e) => {
             tracing::warn!("oidc callback failed: {e:?}");
-            (StatusCode::UNAUTHORIZED, Json(json!({"error": format!("oidc failed: {e}")}))).into_response()
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": format!("oidc failed: {e}")})),
+            )
+                .into_response()
         }
     }
 }
@@ -194,9 +231,16 @@ async fn oidc_callback(
 /// GET /api/balance — authenticated user's Redis balance (JWT context).
 async fn balance(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap) -> Response {
     let Some(jwt) = &st.jwt else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "jwt disabled"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "jwt disabled"})),
+        )
+            .into_response();
     };
-    let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
     match jwt.verify(token) {
         Ok(claims) => {
@@ -209,12 +253,24 @@ async fn balance(State(st): State<Arc<PortalState>>, headers: axum::http::Header
                         .arg(format!("balance:user-{}", claims.uid))
                         .query(&mut conn)
                         .unwrap_or(0);
-                    (StatusCode::OK, Json(json!({"user_id": claims.uid, "balance_micros": bal}))).into_response()
+                    (
+                        StatusCode::OK,
+                        Json(json!({"user_id": claims.uid, "balance_micros": bal})),
+                    )
+                        .into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("redis: {e}")}))).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("redis: {e}")})),
+                )
+                    .into_response(),
             }
         }
-        Err(_) => (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response(),
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        )
+            .into_response(),
     }
 }
 
@@ -224,17 +280,29 @@ struct CredReq {
     password: String,
 }
 
-async fn register(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, Json(req): Json<CredReq>) -> Response {
+async fn register(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CredReq>,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
     match st.auth.register(&req.username, &req.password).await {
-        Ok(id) => (StatusCode::OK, Json(json!({"user_id": id, "username": req.username}))).into_response(),
+        Ok(id) => (
+            StatusCode::OK,
+            Json(json!({"user_id": id, "username": req.username})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::CONFLICT, Json(json!({"error": e}))).into_response(),
     }
 }
 
-async fn login(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, Json(req): Json<CredReq>) -> Response {
+async fn login(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CredReq>,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
@@ -263,7 +331,12 @@ struct KeyReq {
     concurrency_limit: Option<u64>,
 }
 
-async fn create_key(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, uri: axum::http::Uri, Json(req): Json<KeyReq>) -> Response {
+async fn create_key(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    Json(req): Json<KeyReq>,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
@@ -276,13 +349,25 @@ async fn create_key(State(st): State<Arc<PortalState>>, headers: axum::http::Hea
         tpm: req.tpm_limit.unwrap_or(0),
         concurrency: req.concurrency_limit.unwrap_or(0),
     };
-    match st.auth.create_key(uid, req.name.as_deref().unwrap_or(""), limits).await {
-        Ok(key) => (StatusCode::OK, Json(json!({"key": key, "note": "shown once"}))).into_response(),
+    match st
+        .auth
+        .create_key(uid, req.name.as_deref().unwrap_or(""), limits)
+        .await
+    {
+        Ok(key) => (
+            StatusCode::OK,
+            Json(json!({"key": key, "note": "shown once"})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
 
-async fn list_keys(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, uri: axum::http::Uri) -> Response {
+async fn list_keys(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
@@ -303,7 +388,12 @@ struct RechargeReq {
     idempotency_key: String,
 }
 
-async fn recharge(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, uri: axum::http::Uri, Json(req): Json<RechargeReq>) -> Response {
+async fn recharge(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+    Json(req): Json<RechargeReq>,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
@@ -311,8 +401,16 @@ async fn recharge(State(st): State<Arc<PortalState>>, headers: axum::http::Heade
         Ok(u) => u,
         Err(r) => return r,
     };
-    match st.pay.recharge(uid, req.amount_micros, &req.idempotency_key).await {
-        Ok(id) => (StatusCode::OK, Json(json!({"recharge_id": id, "status": "PENDING"}))).into_response(),
+    match st
+        .pay
+        .recharge(uid, req.amount_micros, &req.idempotency_key)
+        .await
+    {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(json!({"recharge_id": id, "status": "PENDING"})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -324,31 +422,59 @@ struct PayReq {
     channel: String,
 }
 
-async fn pay(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, Json(req): Json<PayReq>) -> Response {
+async fn pay(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<PayReq>,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
-    let channel = if req.channel.is_empty() { "mock" } else { &req.channel };
+    let channel = if req.channel.is_empty() {
+        "mock"
+    } else {
+        &req.channel
+    };
     match st.pay.pay(req.recharge_id, channel).await {
-        Ok(txn) => (StatusCode::OK, Json(json!({"txn_id": txn, "status": "PAID"}))).into_response(),
+        Ok(txn) => (
+            StatusCode::OK,
+            Json(json!({"txn_id": txn, "status": "PAID"})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
 
-async fn recharge_status(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, uri: axum::http::Uri) -> Response {
+async fn recharge_status(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
     if !admin_auth(&st, &headers).await {
         return unauthorized();
     }
     let rid = uri
         .query()
-        .and_then(|s| s.split('&').find(|kv| kv.starts_with("recharge_id=")).map(|kv| kv[12..].to_string()))
+        .and_then(|s| {
+            s.split('&')
+                .find(|kv| kv.starts_with("recharge_id="))
+                .map(|kv| kv[12..].to_string())
+        })
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
     if rid <= 0 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "recharge_id required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "recharge_id required"})),
+        )
+            .into_response();
     }
     match st.pay.recharge_status(rid).await {
-        Ok(status) => (StatusCode::OK, Json(json!({"recharge_id": rid, "status": status}))).into_response(),
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({"recharge_id": rid, "status": status})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response(),
     }
 }

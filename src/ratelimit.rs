@@ -9,8 +9,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use redis::aio::ConnectionManager;
 use redis::Script;
+use redis::aio::ConnectionManager;
 
 use crate::auth::CachedKeyStore;
 
@@ -67,12 +67,18 @@ pub struct ConcurrencyGuard {
 
 impl ConcurrencyGuard {
     fn new(scope: &str, redis: ConnectionManager) -> Self {
-        Self { scope: scope.to_string(), redis: Some(redis) }
+        Self {
+            scope: scope.to_string(),
+            redis: Some(redis),
+        }
     }
 
     /// A no-op guard for the unlimited path.
     fn noop() -> Self {
-        Self { scope: String::new(), redis: None }
+        Self {
+            scope: String::new(),
+            redis: None,
+        }
     }
 }
 
@@ -81,7 +87,12 @@ impl Drop for ConcurrencyGuard {
         if let Some(mut redis) = self.redis.take() {
             let key = format!("rl:{}:inflight", self.scope);
             tokio::spawn(async move {
-                let _: i64 = redis::cmd("DECRBY").arg(key).arg(1).query_async(&mut redis).await.unwrap_or(0);
+                let _: i64 = redis::cmd("DECRBY")
+                    .arg(key)
+                    .arg(1)
+                    .query_async(&mut redis)
+                    .await
+                    .unwrap_or(0);
             });
         }
     }
@@ -96,9 +107,10 @@ pub struct Checker {
 impl Checker {
     /// Connect to `addr` (host:port, no scheme).
     pub async fn connect(addr: &str) -> Result<Self, String> {
-        let client =
-            redis::Client::open(format!("redis://{addr}")).map_err(|e| e.to_string())?;
-        let mgr = ConnectionManager::new(client).await.map_err(|e| e.to_string())?;
+        let client = redis::Client::open(format!("redis://{addr}")).map_err(|e| e.to_string())?;
+        let mgr = ConnectionManager::new(client)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Self { redis: mgr })
     }
 
@@ -127,7 +139,11 @@ impl Checker {
         let mut redis = self.redis.clone();
         // The key must always carry a TTL so a crashed gateway doesn't
         // leak the counter forever (renew on every acquire).
-        let ttl: i64 = redis::cmd("TTL").arg(&key).query_async(&mut redis).await.unwrap_or(-1);
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(-1);
         if ttl < 0 {
             let _ = redis::cmd("EXPIRE")
                 .arg(&key)
@@ -135,9 +151,19 @@ impl Checker {
                 .query_async::<i64>(&mut redis)
                 .await;
         }
-        let cur: i64 = redis::cmd("INCRBY").arg(&key).arg(1).query_async(&mut redis).await.unwrap_or(0);
+        let cur: i64 = redis::cmd("INCRBY")
+            .arg(&key)
+            .arg(1)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(0);
         if cur > limit as i64 {
-            let _: i64 = redis::cmd("DECRBY").arg(&key).arg(1).query_async(&mut redis).await.unwrap_or(0);
+            let _: i64 = redis::cmd("DECRBY")
+                .arg(&key)
+                .arg(1)
+                .query_async(&mut redis)
+                .await
+                .unwrap_or(0);
             return None;
         }
         Some(ConcurrencyGuard::new(scope, redis))
@@ -154,11 +180,7 @@ impl Checker {
             .invoke_async(&mut redis)
             .await
             .unwrap_or(-1);
-        if res < 0 {
-            Err(RETRY_AFTER_S)
-        } else {
-            Ok(())
-        }
+        if res < 0 { Err(RETRY_AFTER_S) } else { Ok(()) }
     }
 }
 
@@ -190,7 +212,9 @@ impl KeyLimiter {
         }
         self.check.check_rpm(raw_key, limits.rpm).await?;
         // Estimate completion tokens (capped) — same policy as the Go port.
-        self.check.check_tpm(raw_key, limits.tpm, prompt_tokens as u64 + 1000).await?;
+        self.check
+            .check_tpm(raw_key, limits.tpm, prompt_tokens as u64 + 1000)
+            .await?;
         if limits.concurrency > 0 {
             match self.check.acquire(raw_key, limits.concurrency).await {
                 Some(g) => Ok(Some(g)),
@@ -208,9 +232,7 @@ impl crate::gateway::RateLimiter for KeyLimiter {
         raw_key: &'a str,
         prompt_tokens: u32,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<ConcurrencyGuard>, u64>> + Send + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<Option<ConcurrencyGuard>, u64>> + Send + 'a>,
     > {
         Box::pin(async move { self.check(raw_key, prompt_tokens).await })
     }
@@ -242,7 +264,10 @@ mod tests {
         for _ in 0..3 {
             assert!(c.check_rpm(&scope, 3).await.is_ok());
         }
-        assert!(c.check_rpm(&scope, 3).await.is_err(), "4th request over RPM=3");
+        assert!(
+            c.check_rpm(&scope, 3).await.is_err(),
+            "4th request over RPM=3"
+        );
         // other scope unaffected
         assert!(c.check_rpm("other", 3).await.is_ok());
     }
@@ -268,12 +293,18 @@ mod tests {
         let g1 = c.acquire(&scope, 2).await;
         let g2 = c.acquire(&scope, 2).await;
         assert!(g1.is_some() && g2.is_some());
-        assert!(c.acquire(&scope, 2).await.is_none(), "3rd in-flight rejected");
+        assert!(
+            c.acquire(&scope, 2).await.is_none(),
+            "3rd in-flight rejected"
+        );
         drop(g1);
         drop(g2);
         // give the fire-and-forget DECR a moment
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(c.acquire(&scope, 2).await.is_some(), "slot freed after drop");
+        assert!(
+            c.acquire(&scope, 2).await.is_some(),
+            "slot freed after drop"
+        );
     }
 
     #[tokio::test]

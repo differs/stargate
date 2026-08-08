@@ -34,15 +34,35 @@ impl Channel for MockChannel {
 pub struct PaymentService {
     client: Arc<Client>,
     channels: Vec<Box<dyn Channel>>,
-    top_up: Box<dyn Fn(i64, i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + Sync>,
+    top_up: Box<
+        dyn Fn(
+                i64,
+                i64,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+            + Send
+            + Sync,
+    >,
 }
 
 impl PaymentService {
     pub fn new(
         client: Arc<Client>,
-        top_up: Box<dyn Fn(i64, i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> + Send + Sync>,
+        top_up: Box<
+            dyn Fn(
+                    i64,
+                    i64,
+                ) -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                > + Send
+                + Sync,
+        >,
     ) -> Self {
-        Self { client, channels: Vec::new(), top_up }
+        Self {
+            client,
+            channels: Vec::new(),
+            top_up,
+        }
     }
 
     pub fn register_channel(&mut self, ch: Box<dyn Channel>) {
@@ -50,7 +70,12 @@ impl PaymentService {
     }
 
     /// Create a pending recharge (idempotent by idempotency_key).
-    pub async fn recharge(&self, user_id: i64, amount_micros: i64, idempotency_key: &str) -> Result<i64, String> {
+    pub async fn recharge(
+        &self,
+        user_id: i64,
+        amount_micros: i64,
+        idempotency_key: &str,
+    ) -> Result<i64, String> {
         if amount_micros <= 0 {
             return Err("amount must be positive".into());
         }
@@ -96,8 +121,14 @@ impl PaymentService {
         }
         let txn = ch.pay(recharge_id, row.get::<_, i64>(1));
         if ch.name() == "mock" {
-            self.settle_callback(recharge_id, ch.name(), &txn, row.get::<_, i64>(1), "{\"mock\":true}")
-                .await?;
+            self.settle_callback(
+                recharge_id,
+                ch.name(),
+                &txn,
+                row.get::<_, i64>(1),
+                "{\"mock\":true}",
+            )
+            .await?;
         }
         Ok(txn)
     }
@@ -156,6 +187,7 @@ impl PaymentService {
             .query_opt("SELECT status FROM recharges WHERE id=$1", &[&recharge_id])
             .await
             .map_err(|e| e.to_string())?;
-        row.map(|r| r.get::<_, String>(0)).ok_or("recharge not found".into())
+        row.map(|r| r.get::<_, String>(0))
+            .ok_or("recharge not found".into())
     }
 }

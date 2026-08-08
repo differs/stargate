@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -31,16 +31,32 @@ fn registered_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec 
 }
 
 static HTTP_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    registered_counter("stargate_http_requests_total", "HTTP requests by status class", &["code"])
+    registered_counter(
+        "stargate_http_requests_total",
+        "HTTP requests by status class",
+        &["code"],
+    )
 });
 static PRECHARGE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    registered_counter("stargate_precharge_total", "Pre-charge attempts by result", &["result"])
+    registered_counter(
+        "stargate_precharge_total",
+        "Pre-charge attempts by result",
+        &["result"],
+    )
 });
 static ORDERS_SETTLED: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    registered_counter("stargate_orders_settled_total", "Settled orders by status", &["status"])
+    registered_counter(
+        "stargate_orders_settled_total",
+        "Settled orders by status",
+        &["status"],
+    )
 });
 static RATE_LIMITED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    registered_counter("stargate_rate_limited_total", "Requests rejected by quota layer", &["layer"])
+    registered_counter(
+        "stargate_rate_limited_total",
+        "Requests rejected by quota layer",
+        &["layer"],
+    )
 });
 
 /// Rate limiting hook: check quotas for one raw key. Ok(Some(guard)) =
@@ -52,7 +68,12 @@ pub trait RateLimiter: Send + Sync {
         raw_key: &'a str,
         prompt_tokens: u32,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Option<crate::ratelimit::ConcurrencyGuard>, u64>> + Send + '_>,
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<crate::ratelimit::ConcurrencyGuard>, u64>,
+                > + Send
+                + '_,
+        >,
     >;
 }
 
@@ -131,10 +152,13 @@ pub fn record_orders(status: &str, n: usize) {
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-        "error": {"message": "invalid or missing API key", "type": "stargate_error"}
-    })))
-    .into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": {"message": "invalid or missing API key", "type": "stargate_error"}
+        })),
+    )
+        .into_response()
 }
 
 /// Authenticates and returns (user scope, raw key). The raw key is the
@@ -240,9 +264,27 @@ async fn handle_chat(
     }
 
     if req.stream {
-        handle_stream(state, body, request_id, prompt_tokens, req.model, user, pricing).await
+        handle_stream(
+            state,
+            body,
+            request_id,
+            prompt_tokens,
+            req.model,
+            user,
+            pricing,
+        )
+        .await
     } else {
-        handle_non_stream(state, body, request_id, prompt_tokens, req.model, user, pricing).await
+        handle_non_stream(
+            state,
+            body,
+            request_id,
+            prompt_tokens,
+            req.model,
+            user,
+            pricing,
+        )
+        .await
     }
 }
 
@@ -282,11 +324,29 @@ async fn handle_non_stream(
         }
     }
 
-    let event_status = if (200..300).contains(&status) { "completed" } else { "failed" };
+    let event_status = if (200..300).contains(&status) {
+        "completed"
+    } else {
+        "failed"
+    };
     metering_event(&request_id, event_status, prompt_tokens, completion, start);
-    emit_to_settler(&state, &request_id, &user, &model, event_status, prompt_tokens, completion, start, pricing);
+    emit_to_settler(
+        &state,
+        &request_id,
+        &user,
+        &model,
+        event_status,
+        prompt_tokens,
+        completion,
+        start,
+        pricing,
+    );
 
-    (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), resp_body).into_response()
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        resp_body,
+    )
+        .into_response()
 }
 
 async fn handle_stream(
@@ -366,7 +426,17 @@ async fn handle_stream(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(0)).await;
         metering_event(&request_id, "completed", prompt_tokens, completion, start);
-        emit_to_settler(&state2, &request_id, &user2, &model, "completed", prompt_tokens, completion, start, pricing);
+        emit_to_settler(
+            &state2,
+            &request_id,
+            &user2,
+            &model,
+            "completed",
+            prompt_tokens,
+            completion,
+            start,
+            pricing,
+        );
     });
 
     resp
@@ -403,7 +473,13 @@ fn emit_to_settler(
     }
 }
 
-fn metering_event(request_id: &str, status: &str, prompt: u32, completion: u32, start: std::time::Instant) {
+fn metering_event(
+    request_id: &str,
+    status: &str,
+    prompt: u32,
+    completion: u32,
+    start: std::time::Instant,
+) {
     // Audit event at DEBUG level (mirrors MeterGate: durable sinks handle
     // persistence; the log line must never tax the hot path).
     tracing::debug!(
