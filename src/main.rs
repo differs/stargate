@@ -20,6 +20,7 @@ mod gateway;
 mod metering;
 mod openai;
 mod payment;
+mod ratelimit;
 mod portal;
 mod upstream;
 
@@ -86,6 +87,7 @@ async fn main() {
         match auth::AuthService::connect(&pg_dsn).await {
             Ok(auth_svc) => {
                 let auth_svc = std::sync::Arc::new(auth_svc);
+                let pay_redis_addr = redis_addr.clone();
                 let ks = std::sync::Arc::new(auth::CachedKeyStore::new(
                     auth_svc.as_ref().clone(),
                     std::time::Duration::from_secs(60),
@@ -94,7 +96,7 @@ async fn main() {
                 let pay_svc = payment::PaymentService::new(
                     auth_svc.inner(),
                     Box::new(move |user_id: i64, amount: i64| {
-                        let redis_addr = redis_addr.clone();
+                        let redis_addr = pay_redis_addr.clone();
                         Box::pin(async move {
                             let client = redis::Client::open(format!("redis://{redis_addr}"))
                                 .map_err(|e| e.to_string())?;
@@ -176,7 +178,22 @@ async fn main() {
         }
     }
 
-    let app = gateway::router_full(cfg, billing, key_store);
+    // --- rate limiting (per-key RPM/TPM/concurrency) ---
+    let limiter: Option<Arc<dyn gateway::RateLimiter>> = match (&key_store, !redis_addr.is_empty()) {
+        (Some(ks), true) => match crate::ratelimit::Checker::connect(&redis_addr).await {
+            Ok(check) => {
+                tracing::info!("rate limiting enabled (RPM/TPM/concurrency per key)");
+                Some(Arc::new(crate::ratelimit::KeyLimiter::new(check, ks.clone())))
+            }
+            Err(e) => {
+                tracing::error!("rate limiter init failed, running without: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    let app = gateway::router_full(cfg, billing, key_store, limiter);
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("stargate listening on {addr} (upstream: {upstream_url})");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");

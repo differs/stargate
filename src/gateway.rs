@@ -39,6 +39,22 @@ static PRECHARGE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static ORDERS_SETTLED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     registered_counter("stargate_orders_settled_total", "Settled orders by status", &["status"])
 });
+static RATE_LIMITED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    registered_counter("stargate_rate_limited_total", "Requests rejected by quota layer", &["layer"])
+});
+
+/// Rate limiting hook: check quotas for one raw key. Ok(Some(guard)) =
+/// hold the guard (drops the in-flight slot on request end); Ok(None) =
+/// pass without a slot; Err(retry_after) = over a limit.
+pub trait RateLimiter: Send + Sync {
+    fn allow<'a>(
+        &'a self,
+        raw_key: &'a str,
+        prompt_tokens: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<crate::ratelimit::ConcurrencyGuard>, u64>> + Send + '_>,
+    >;
+}
 
 pub struct Config {
     pub upstream_url: String,
@@ -53,16 +69,19 @@ pub struct AppState {
     billing: Option<Arc<BillingHandle>>,
     /// Optional DB-backed key resolution (static allowlist checked first).
     key_store: Option<Arc<crate::auth::CachedKeyStore>>,
+    /// Optional per-key quota enforcement (RPM/TPM/concurrency).
+    limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 pub fn router_with_billing(cfg: Arc<Config>, billing: Option<Arc<BillingHandle>>) -> Router {
-    router_full(cfg, billing, None)
+    router_full(cfg, billing, None, None)
 }
 
 pub fn router_full(
     cfg: Arc<Config>,
     billing: Option<Arc<BillingHandle>>,
     key_store: Option<Arc<crate::auth::CachedKeyStore>>,
+    limiter: Option<Arc<dyn RateLimiter>>,
 ) -> Router {
     let keys: HashSet<String> = cfg.api_keys.iter().cloned().collect();
     let state = Arc::new(AppState {
@@ -70,6 +89,7 @@ pub fn router_full(
         keys,
         billing,
         key_store,
+        limiter,
         cfg,
     });
     Router::new()
@@ -102,6 +122,10 @@ pub fn record_precharge(result: &str) {
     PRECHARGE_TOTAL.with_label_values(&[result]).inc();
 }
 
+pub fn record_rate_limited(layer: &str) {
+    RATE_LIMITED_TOTAL.with_label_values(&[layer]).inc();
+}
+
 pub fn record_orders(status: &str, n: usize) {
     ORDERS_SETTLED.with_label_values(&[status]).inc_by(n as u64);
 }
@@ -113,7 +137,10 @@ fn unauthorized() -> Response {
     .into_response()
 }
 
-async fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+/// Authenticates and returns (user scope, raw key). The raw key is the
+/// quota scope: per-key stored limits apply; static allowlist keys have
+/// no stored limits and pass the quota layer.
+async fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<(String, String), Response> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -123,12 +150,12 @@ async fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<String, Res
         return Err(unauthorized());
     }
     if state.keys.contains(key) {
-        return Ok(key.to_string()); // static allowlist fast path
+        return Ok((key.to_string(), key.to_string())); // static allowlist fast path
     }
     // DB-backed stored keys (cached)
     if let Some(ks) = &state.key_store {
         match ks.resolve(key).await {
-            Ok(uid) => return Ok(format!("user-{uid}")),
+            Ok(uid) => return Ok((format!("user-{uid}"), key.to_string())),
             Err(_) => return Err(unauthorized()),
         }
     }
@@ -140,7 +167,7 @@ async fn handle_chat(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let user = match auth_check(&state, &headers).await {
+    let (user, raw_key) = match auth_check(&state, &headers).await {
         Ok(u) => u,
         Err(r) => {
             record_http(401);
@@ -173,6 +200,27 @@ async fn handle_chat(
     // Freeze the price at request start: settlement must use this, never
     // the current table (in-flight requests are not repriced).
     let pricing = Some(billing::price_for(&req.model));
+
+    // Rate limiting (RPM/TPM/concurrency) before the billing fast path.
+    // The guard (if any) releases the in-flight slot when dropped.
+    let mut _rate_guard = None;
+    if let Some(limiter) = &state.limiter {
+        match limiter.allow(&raw_key, prompt_tokens).await {
+            Ok(guard) => _rate_guard = guard,
+            Err(retry_after) => {
+                record_http(429);
+                record_rate_limited("key");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": {"message": "rate limit exceeded", "type": "stargate_error"}
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Billing fast path: atomic pre-charge before touching the upstream.
     if let Some(bh) = &state.billing {

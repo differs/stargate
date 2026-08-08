@@ -258,6 +258,9 @@ async fn login(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMa
 #[derive(Deserialize)]
 struct KeyReq {
     name: Option<String>,
+    rpm_limit: Option<u64>,
+    tpm_limit: Option<u64>,
+    concurrency_limit: Option<u64>,
 }
 
 async fn create_key(State(st): State<Arc<PortalState>>, headers: axum::http::HeaderMap, uri: axum::http::Uri, Json(req): Json<KeyReq>) -> Response {
@@ -268,7 +271,12 @@ async fn create_key(State(st): State<Arc<PortalState>>, headers: axum::http::Hea
         Ok(u) => u,
         Err(r) => return r,
     };
-    match st.auth.create_key(uid, req.name.as_deref().unwrap_or("")).await {
+    let limits = crate::ratelimit::Limits {
+        rpm: req.rpm_limit.unwrap_or(0),
+        tpm: req.tpm_limit.unwrap_or(0),
+        concurrency: req.concurrency_limit.unwrap_or(0),
+    };
+    match st.auth.create_key(uid, req.name.as_deref().unwrap_or(""), limits).await {
         Ok(key) => (StatusCode::OK, Json(json!({"key": key, "note": "shown once"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }

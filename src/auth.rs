@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     status        SMALLINT NOT NULL DEFAULT 1,
+    rpm_limit     BIGINT NOT NULL DEFAULT 0,
+    tpm_limit     BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -29,6 +31,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash      TEXT UNIQUE NOT NULL,
     name          TEXT NOT NULL DEFAULT '',
     status        SMALLINT NOT NULL DEFAULT 1,
+    rpm_limit     BIGINT NOT NULL DEFAULT 0,
+    tpm_limit     BIGINT NOT NULL DEFAULT 0,
+    concurrency_limit BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at  TIMESTAMPTZ
 );
@@ -120,18 +125,50 @@ impl AuthService {
     }
 
     /// Create an API key (raw shown once; only sha256 stored).
-    pub async fn create_key(&self, user_id: i64, name: &str) -> Result<String, String> {
+    pub async fn create_key(
+        &self,
+        user_id: i64,
+        name: &str,
+        limits: crate::ratelimit::Limits,
+    ) -> Result<String, String> {
         let raw: Vec<u8> = (0..24).map(|_| rand::random::<u8>()).collect();
         let key = format!("sk-{}", hex::encode(&raw));
         let hash = key_hash(&key);
         self.client
             .execute(
-                "INSERT INTO api_keys (user_id, key_hash, name) VALUES ($1,$2,$3)",
-                &[&user_id, &hash, &name],
+                "INSERT INTO api_keys (user_id, key_hash, name, rpm_limit, tpm_limit, concurrency_limit) \
+                 VALUES ($1,$2,$3,$4,$5,$6)",
+                &[
+                    &user_id,
+                    &hash,
+                    &name,
+                    &(limits.rpm as i64),
+                    &(limits.tpm as i64),
+                    &(limits.concurrency as i64),
+                ],
             )
             .await
             .map_err(|e| e.to_string())?;
         Ok(key)
+    }
+
+    /// Stored rate limits of a raw key (0 = unlimited).
+    pub async fn resolve_limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
+        let hash = key_hash(raw_key);
+        let row = self
+            .client
+            .query_opt(
+                "SELECT rpm_limit, tpm_limit, concurrency_limit FROM api_keys WHERE key_hash=$1",
+                &[&hash],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else { return Err("key not found".into()) };
+        Ok(crate::ratelimit::Limits {
+            rpm: row.get::<_, i64>(0).max(0) as u64,
+            tpm: row.get::<_, i64>(1).max(0) as u64,
+            concurrency: row.get::<_, i64>(2).max(0) as u64,
+        })
     }
 
     /// List a user's keys (no hashes).
@@ -199,6 +236,12 @@ impl CachedKeyStore {
         Self { svc, ttl, cache: Mutex::new(Default::default()) }
     }
 
+    /// Stored limits with cache (negative entries cached shorter).
+    pub async fn limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
+        self.resolve(raw_key).await?; // fast-fail on unknown keys
+        Ok(self.svc.resolve_limits(raw_key).await.unwrap_or_default())
+    }
+
     /// Resolve with cache (negative entries cached shorter).
     pub async fn resolve(&self, raw_key: &str) -> Result<i64, String> {
         let now = Instant::now();
@@ -228,3 +271,37 @@ impl CachedKeyStore {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_key_serializes_limits() {
+        let Ok(dsn) = std::env::var("STARGATE_TEST_PG") else {
+            eprintln!("skipping: STARGATE_TEST_PG not set");
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await.expect("pg connect");
+        tokio::spawn(async move { let _ = conn.await; });
+        let svc = AuthService { client: Arc::new(client) };
+        // NOTE: extended-protocol execute cannot run multiple statements;
+        // DROP + rebuild must use batch_execute (same as connect does).
+        svc.client
+            .batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users")
+            .await
+            .unwrap();
+        svc.client.batch_execute("DROP TABLE IF EXISTS payments, recharges, api_keys, users CASCADE").await.unwrap();
+        svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
+        let _ = svc.register("ckprobe", "password123").await;
+        let key = svc.create_key(1, "probe", crate::ratelimit::Limits { rpm: 3, tpm: 100, concurrency: 2 }).await;
+        match key {
+            Ok(k) => {
+                let l = svc.resolve_limits(&k).await.expect("resolve limits");
+                assert_eq!(l, crate::ratelimit::Limits { rpm: 3, tpm: 100, concurrency: 2 });
+                println!("create_key OK: rpm={} tpm={} concurrency={}", l.rpm, l.tpm, l.concurrency);
+            }
+            Err(e) => eprintln!("create_key FAILED: {e}"),
+        }
+    }
+}
