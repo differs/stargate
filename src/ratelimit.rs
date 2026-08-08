@@ -32,9 +32,6 @@ pub struct QuotaExceeded {
     pub layer: &'static str, // "key" | "user" (six-layer budget model)
 }
 
-/// Retry-After we advertise on 429 (safe estimate of the window slide).
-const RETRY_AFTER_S: u64 = 30;
-
 /// Sliding-window counter with expiry (same semantics as the Go port):
 ///
 ///   KEYS[1] = rl:{scope}:{kind}
@@ -49,7 +46,10 @@ local weight = tonumber(ARGV[4])
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - win)
 local count = tonumber(redis.call('ZCARD', KEYS[1]) or '0')
 if count + weight > limit then
-  return -1
+  local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+  local oldest_ts = tonumber(oldest[2]) or now
+  local retry = math.floor((oldest_ts + win - now) / 1000) + 1
+  return -retry
 end
 for i = 1, weight do
   redis.call('ZADD', KEYS[1], now, now .. ':' .. redis.call('INCR', KEYS[1] .. ':seq'))
@@ -187,7 +187,12 @@ impl Checker {
             .invoke_async(&mut redis)
             .await
             .unwrap_or(-1);
-        if res < 0 { Err(RETRY_AFTER_S) } else { Ok(()) }
+        if res < 0 {
+            // |res| = precise retry-after until the oldest entry slides out.
+            Err((-res) as u64)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -249,11 +254,11 @@ impl KeyLimiter {
 
         // --- Layer 2: user-level aggregate budget (shared across keys) ---
         if let Ok(uid) = self.keys.resolve(raw_key).await {
+            let user_layer = |r: u64| QuotaExceeded {
+                retry_after: r,
+                layer: "user",
+            };
             if let Ok(ul) = self.keys.user_limits(uid).await {
-                let user_layer = |r: u64| QuotaExceeded {
-                    retry_after: r,
-                    layer: "user",
-                };
                 if ul.rpm > 0 || ul.tpm > 0 {
                     let scope = format!("user-{uid}");
                     if ul.rpm > 0 {
@@ -267,6 +272,33 @@ impl KeyLimiter {
                             .check_tpm(&scope, ul.tpm, prompt_tokens as u64 + 1000)
                             .await
                             .map_err(user_layer)?;
+                    }
+                }
+            }
+
+            // --- Layer 3: project-level budget (shared across users) ---
+            if let Ok(pid) = self.keys.project_of_user(uid).await {
+                if pid > 0 {
+                    let project_layer = |r: u64| QuotaExceeded {
+                        retry_after: r,
+                        layer: "project",
+                    };
+                    if let Ok(pl) = self.keys.project_limits(pid).await {
+                        if pl.rpm > 0 || pl.tpm > 0 {
+                            let scope = format!("project-{pid}");
+                            if pl.rpm > 0 {
+                                self.check
+                                    .check_rpm(&scope, pl.rpm)
+                                    .await
+                                    .map_err(project_layer)?;
+                            }
+                            if pl.tpm > 0 {
+                                self.check
+                                    .check_tpm(&scope, pl.tpm, prompt_tokens as u64 + 1000)
+                                    .await
+                                    .map_err(project_layer)?;
+                            }
+                        }
                     }
                 }
             }

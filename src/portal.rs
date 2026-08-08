@@ -117,6 +117,15 @@ pub fn router(state: Arc<PortalState>) -> Router {
         .route(
             "/api/admin/users/{id}/limits",
             axum::routing::put(set_user_limits),
+        )
+        .route(
+            "/api/admin/users/{id}/project",
+            axum::routing::put(set_user_project),
+        )
+        .route("/api/admin/projects", axum::routing::post(create_project))
+        .route(
+            "/api/admin/projects/{id}/limits",
+            axum::routing::put(set_project_limits),
         );
     if let Some(dir) = &state.web_dir {
         app = app.fallback_service(tower_http::services::ServeDir::new(dir));
@@ -293,12 +302,7 @@ async fn set_user_limits(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     Json(req): Json<SetLimitsReq>,
 ) -> Response {
-    let admin_ok = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|auth| auth.strip_prefix("Bearer ").unwrap_or("") == st.admin_key)
-        .unwrap_or(false);
-    if !admin_ok {
+    if !admin_key_only(&st, &headers) {
         return unauthorized();
     }
     match st
@@ -324,6 +328,111 @@ async fn set_user_limits(
 struct SetLimitsReq {
     rpm_limit: u64,
     tpm_limit: u64,
+}
+
+/// Platform policy endpoints require the admin key — session JWTs are
+/// NOT accepted (a stolen session must not change quotas).
+fn admin_key_only(state: &PortalState, headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|auth| auth.strip_prefix("Bearer ").unwrap_or("") == state.admin_key)
+        .unwrap_or(false)
+}
+
+/// Assign a user to a project (shares its budget).
+async fn set_user_project(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(user_id): axum::extract::Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    let project_id = req.get("project_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if project_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"message": "project_id required"}})),
+        )
+            .into_response();
+    }
+    match st.auth.set_user_project(user_id, project_id).await {
+        Ok(()) => {
+            Json(serde_json::json!({"user_id": user_id, "project_id": project_id})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Create a project with an aggregate quota.
+async fn create_project(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    let name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rpm = req.get("rpm_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    let tpm = req.get("tpm_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"message": "name required"}})),
+        )
+            .into_response();
+    }
+    match st.auth.create_project(&name, rpm, tpm).await {
+        Ok(id) => {
+            Json(serde_json::json!({"id": id, "name": name, "rpm_limit": rpm, "tpm_limit": tpm}))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("create failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Update a project's aggregate quota.
+async fn set_project_limits(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(project_id): axum::extract::Path<i64>,
+    Json(req): Json<SetLimitsReq>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    match st
+        .auth
+        .set_project_limits(project_id, req.rpm_limit, req.tpm_limit)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "project_id": project_id,
+            "rpm_limit": req.rpm_limit,
+            "tpm_limit": req.tpm_limit,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
 }
 
 async fn register(

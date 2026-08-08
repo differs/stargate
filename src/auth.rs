@@ -16,6 +16,13 @@ pub struct AuthService {
 
 /// Commercial schema (users/api_keys/recharges/payments).
 pub const COMMERCIAL_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS projects (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    rpm_limit  BIGINT NOT NULL DEFAULT 0,
+    tpm_limit  BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS users (
     id            BIGSERIAL PRIMARY KEY,
     username      TEXT UNIQUE NOT NULL,
@@ -23,8 +30,10 @@ CREATE TABLE IF NOT EXISTS users (
     status        SMALLINT NOT NULL DEFAULT 1,
     rpm_limit     BIGINT NOT NULL DEFAULT 0,
     tpm_limit     BIGINT NOT NULL DEFAULT 0,
+    project_id    BIGINT REFERENCES projects(id),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id);
 CREATE TABLE IF NOT EXISTS api_keys (
     id            BIGSERIAL PRIMARY KEY,
     user_id       BIGINT NOT NULL REFERENCES users(id),
@@ -197,6 +206,87 @@ impl AuthService {
         Ok(())
     }
 
+    /// Layer 3: project aggregate quota (0 = unlimited).
+    pub async fn resolve_project_limits(
+        &self,
+        project_id: i64,
+    ) -> Result<crate::ratelimit::Limits, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT rpm_limit, tpm_limit FROM projects WHERE id=$1",
+                &[&project_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("project not found".into());
+        };
+        Ok(crate::ratelimit::Limits {
+            rpm: row.get::<_, i64>(0).max(0) as u64,
+            tpm: row.get::<_, i64>(1).max(0) as u64,
+            concurrency: 0,
+        })
+    }
+
+    /// Update a project's aggregate quota (admin operation).
+    pub async fn set_project_limits(
+        &self,
+        project_id: i64,
+        rpm: u64,
+        tpm: u64,
+    ) -> Result<(), String> {
+        self.client
+            .execute(
+                "UPDATE projects SET rpm_limit=$2, tpm_limit=$3 WHERE id=$1",
+                &[&project_id, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Create a project with an aggregate quota; returns its id.
+    pub async fn create_project(&self, name: &str, rpm: u64, tpm: u64) -> Result<i64, String> {
+        let row = self
+            .client
+            .query_one(
+                "INSERT INTO projects (name, rpm_limit, tpm_limit) VALUES ($1,$2,$3) RETURNING id",
+                &[&name, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.get(0))
+    }
+
+    /// Assign a user to a project (shares its budget).
+    pub async fn set_user_project(&self, user_id: i64, project_id: i64) -> Result<(), String> {
+        self.client
+            .execute(
+                "UPDATE users SET project_id=$2 WHERE id=$1",
+                &[&user_id, &project_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The project a user belongs to (0 = none).
+    pub async fn project_of_user(&self, user_id: i64) -> Result<i64, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT COALESCE(project_id, 0) FROM users WHERE id=$1",
+                &[&user_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("user not found".into());
+        };
+        Ok(row.get(0))
+    }
+
     /// Stored rate limits of a raw key (0 = unlimited).
     pub async fn resolve_limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
         let hash = key_hash(raw_key);
@@ -286,6 +376,9 @@ pub struct CachedKeyStore {
     cache: Mutex<std::collections::HashMap<String, (i64, Instant)>>,
     limits_cache: Mutex<std::collections::HashMap<String, (crate::ratelimit::Limits, Instant)>>,
     user_limits_cache: Mutex<std::collections::HashMap<i64, (crate::ratelimit::Limits, Instant)>>,
+    project_of_user_cache: Mutex<std::collections::HashMap<i64, (i64, Instant)>>,
+    project_limits_cache:
+        Mutex<std::collections::HashMap<i64, (crate::ratelimit::Limits, Instant)>>,
 }
 
 impl CachedKeyStore {
@@ -296,6 +389,8 @@ impl CachedKeyStore {
             cache: Mutex::new(Default::default()),
             limits_cache: Mutex::new(Default::default()),
             user_limits_cache: Mutex::new(Default::default()),
+            project_of_user_cache: Mutex::new(Default::default()),
+            project_limits_cache: Mutex::new(Default::default()),
         }
     }
 
@@ -335,6 +430,47 @@ impl CachedKeyStore {
             .lock()
             .unwrap()
             .insert(user_id, (l, now));
+        Ok(l)
+    }
+
+    /// Project membership with cache (0 = none).
+    pub async fn project_of_user(&self, user_id: i64) -> Result<i64, String> {
+        let now = Instant::now();
+        {
+            let cache = self.project_of_user_cache.lock().unwrap();
+            if let Some((pid, at)) = cache.get(&user_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*pid);
+                }
+            }
+        }
+        let pid = self.svc.project_of_user(user_id).await?;
+        self.project_of_user_cache
+            .lock()
+            .unwrap()
+            .insert(user_id, (pid, now));
+        Ok(pid)
+    }
+
+    /// Project-level aggregate quota with cache.
+    pub async fn project_limits(
+        &self,
+        project_id: i64,
+    ) -> Result<crate::ratelimit::Limits, String> {
+        let now = Instant::now();
+        {
+            let cache = self.project_limits_cache.lock().unwrap();
+            if let Some((l, at)) = cache.get(&project_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*l);
+                }
+            }
+        }
+        let l = self.svc.resolve_project_limits(project_id).await?;
+        self.project_limits_cache
+            .lock()
+            .unwrap()
+            .insert(project_id, (l, now));
         Ok(l)
     }
 
@@ -453,5 +589,47 @@ mod tests {
         assert_eq!(l.rpm, 5);
         assert_eq!(l.tpm, 1000);
         println!("user_limits OK: rpm={} tpm={} (uid={uid})", l.rpm, l.tpm);
+    }
+
+    /// Project roundtrip (layer 3): create → set → assign user → read back.
+    #[tokio::test]
+    async fn project_roundtrip() {
+        let Ok(dsn) = std::env::var("STARGATE_TEST_PG") else {
+            eprintln!("skipping: STARGATE_TEST_PG not set");
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
+            .await
+            .expect("pg connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let svc = AuthService {
+            client: Arc::new(client),
+        };
+        svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
+
+        let pid = svc
+            .create_project("probe-project", 0, 0)
+            .await
+            .expect("create");
+        let l = svc
+            .resolve_project_limits(pid)
+            .await
+            .expect("resolve default");
+        assert_eq!(l.rpm, 0, "new project unlimited");
+        assert_eq!(l.tpm, 0);
+
+        svc.set_project_limits(pid, 10, 5000).await.expect("set");
+        let l = svc.resolve_project_limits(pid).await.expect("resolve set");
+        assert_eq!(l.rpm, 10);
+        assert_eq!(l.tpm, 5000);
+
+        let username = format!("proj-user-{}", std::process::id());
+        let uid = svc.register(&username, "password123").await.unwrap();
+        svc.set_user_project(uid, pid).await.expect("assign");
+        let got = svc.project_of_user(uid).await.expect("membership");
+        assert_eq!(got, pid, "user must belong to the project");
+        println!("project OK: pid={pid} rpm=10 tpm=5000 uid={uid}");
     }
 }
