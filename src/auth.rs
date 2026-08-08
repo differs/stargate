@@ -16,13 +16,32 @@ pub struct AuthService {
 
 /// Commercial schema (users/api_keys/recharges/payments).
 pub const COMMERCIAL_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS projects (
+CREATE TABLE IF NOT EXISTS orgs (
     id         BIGSERIAL PRIMARY KEY,
     name       TEXT NOT NULL,
     rpm_limit  BIGINT NOT NULL DEFAULT 0,
     tpm_limit  BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS teams (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    org_id     BIGINT REFERENCES orgs(id),
+    rpm_limit  BIGINT NOT NULL DEFAULT 0,
+    tpm_limit  BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_teams_org ON teams (org_id);
+CREATE TABLE IF NOT EXISTS projects (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    team_id    BIGINT REFERENCES teams(id),
+    rpm_limit  BIGINT NOT NULL DEFAULT 0,
+    tpm_limit  BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS team_id BIGINT REFERENCES teams(id);
+CREATE INDEX IF NOT EXISTS idx_projects_team ON projects (team_id);
 CREATE TABLE IF NOT EXISTS users (
     id            BIGSERIAL PRIMARY KEY,
     username      TEXT UNIQUE NOT NULL,
@@ -43,9 +62,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
     rpm_limit     BIGINT NOT NULL DEFAULT 0,
     tpm_limit     BIGINT NOT NULL DEFAULT 0,
     concurrency_limit BIGINT NOT NULL DEFAULT 0,
+    end_user_rpm_limit BIGINT NOT NULL DEFAULT 0,
+    end_user_tpm_limit BIGINT NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at  TIMESTAMPTZ
 );
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS end_user_rpm_limit BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS end_user_tpm_limit BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys (user_id);
 CREATE TABLE IF NOT EXISTS recharges (
     id              BIGSERIAL PRIMARY KEY,
@@ -154,8 +177,8 @@ impl AuthService {
         let hash = key_hash(&key);
         self.client
             .execute(
-                "INSERT INTO api_keys (user_id, key_hash, name, rpm_limit, tpm_limit, concurrency_limit) \
-                 VALUES ($1,$2,$3,$4,$5,$6)",
+                "INSERT INTO api_keys (user_id, key_hash, name, rpm_limit, tpm_limit, concurrency_limit, end_user_rpm_limit, end_user_tpm_limit) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                 &[
                     &user_id,
                     &hash,
@@ -163,6 +186,8 @@ impl AuthService {
                     &(limits.rpm as i64),
                     &(limits.tpm as i64),
                     &(limits.concurrency as i64),
+                    &(limits.end_user_rpm as i64),
+                    &(limits.end_user_tpm as i64),
                 ],
             )
             .await
@@ -191,6 +216,7 @@ impl AuthService {
             rpm: row.get::<_, i64>(0).max(0) as u64,
             tpm: row.get::<_, i64>(1).max(0) as u64,
             concurrency: 0,
+            ..Default::default()
         })
     }
 
@@ -226,6 +252,7 @@ impl AuthService {
             rpm: row.get::<_, i64>(0).max(0) as u64,
             tpm: row.get::<_, i64>(1).max(0) as u64,
             concurrency: 0,
+            ..Default::default()
         })
     }
 
@@ -287,13 +314,161 @@ impl AuthService {
         Ok(row.get(0))
     }
 
+    /// Layer 5: org aggregate quota (0 = unlimited).
+    pub async fn resolve_org_limits(
+        &self,
+        org_id: i64,
+    ) -> Result<crate::ratelimit::Limits, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT rpm_limit, tpm_limit FROM orgs WHERE id=$1",
+                &[&org_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("org not found".into());
+        };
+        Ok(crate::ratelimit::Limits {
+            rpm: row.get::<_, i64>(0).max(0) as u64,
+            tpm: row.get::<_, i64>(1).max(0) as u64,
+            concurrency: 0,
+            ..Default::default()
+        })
+    }
+
+    /// Update an org's aggregate quota (admin operation).
+    pub async fn set_org_limits(&self, org_id: i64, rpm: u64, tpm: u64) -> Result<(), String> {
+        self.client
+            .execute(
+                "UPDATE orgs SET rpm_limit=$2, tpm_limit=$3 WHERE id=$1",
+                &[&org_id, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Create an org with an aggregate quota; returns its id.
+    pub async fn create_org(&self, name: &str, rpm: u64, tpm: u64) -> Result<i64, String> {
+        let row = self
+            .client
+            .query_one(
+                "INSERT INTO orgs (name, rpm_limit, tpm_limit) VALUES ($1,$2,$3) RETURNING id",
+                &[&name, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.get(0))
+    }
+
+    /// Layer 4: team aggregate quota (0 = unlimited).
+    pub async fn resolve_team_limits(
+        &self,
+        team_id: i64,
+    ) -> Result<crate::ratelimit::Limits, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT rpm_limit, tpm_limit FROM teams WHERE id=$1",
+                &[&team_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("team not found".into());
+        };
+        Ok(crate::ratelimit::Limits {
+            rpm: row.get::<_, i64>(0).max(0) as u64,
+            tpm: row.get::<_, i64>(1).max(0) as u64,
+            concurrency: 0,
+            ..Default::default()
+        })
+    }
+
+    /// Update a team's aggregate quota (admin operation).
+    pub async fn set_team_limits(&self, team_id: i64, rpm: u64, tpm: u64) -> Result<(), String> {
+        self.client
+            .execute(
+                "UPDATE teams SET rpm_limit=$2, tpm_limit=$3 WHERE id=$1",
+                &[&team_id, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Create a team inside an org; returns its id.
+    pub async fn create_team(
+        &self,
+        name: &str,
+        org_id: i64,
+        rpm: u64,
+        tpm: u64,
+    ) -> Result<i64, String> {
+        let row = self
+            .client
+            .query_one(
+                "INSERT INTO teams (name, org_id, rpm_limit, tpm_limit) VALUES ($1,$2,$3,$4) RETURNING id",
+                &[&name, &org_id, &(rpm as i64), &(tpm as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.get(0))
+    }
+
+    /// Attach a project to a team (shares the team budget).
+    pub async fn set_project_team(&self, project_id: i64, team_id: i64) -> Result<(), String> {
+        self.client
+            .execute(
+                "UPDATE projects SET team_id=$2 WHERE id=$1",
+                &[&project_id, &team_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The team a project belongs to (0 = none).
+    pub async fn team_of_project(&self, project_id: i64) -> Result<i64, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT COALESCE(team_id, 0) FROM projects WHERE id=$1",
+                &[&project_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("project not found".into());
+        };
+        Ok(row.get(0))
+    }
+
+    /// The org a team belongs to (0 = none).
+    pub async fn org_of_team(&self, team_id: i64) -> Result<i64, String> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT COALESCE(org_id, 0) FROM teams WHERE id=$1",
+                &[&team_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Err("team not found".into());
+        };
+        Ok(row.get(0))
+    }
+
     /// Stored rate limits of a raw key (0 = unlimited).
     pub async fn resolve_limits(&self, raw_key: &str) -> Result<crate::ratelimit::Limits, String> {
         let hash = key_hash(raw_key);
         let row = self
             .client
             .query_opt(
-                "SELECT rpm_limit, tpm_limit, concurrency_limit FROM api_keys WHERE key_hash=$1",
+                "SELECT rpm_limit, tpm_limit, concurrency_limit, end_user_rpm_limit, end_user_tpm_limit FROM api_keys WHERE key_hash=$1",
                 &[&hash],
             )
             .await
@@ -305,6 +480,8 @@ impl AuthService {
             rpm: row.get::<_, i64>(0).max(0) as u64,
             tpm: row.get::<_, i64>(1).max(0) as u64,
             concurrency: row.get::<_, i64>(2).max(0) as u64,
+            end_user_rpm: row.get::<_, i64>(3).max(0) as u64,
+            end_user_tpm: row.get::<_, i64>(4).max(0) as u64,
         })
     }
 
@@ -379,6 +556,10 @@ pub struct CachedKeyStore {
     project_of_user_cache: Mutex<std::collections::HashMap<i64, (i64, Instant)>>,
     project_limits_cache:
         Mutex<std::collections::HashMap<i64, (crate::ratelimit::Limits, Instant)>>,
+    team_of_project_cache: Mutex<std::collections::HashMap<i64, (i64, Instant)>>,
+    team_limits_cache: Mutex<std::collections::HashMap<i64, (crate::ratelimit::Limits, Instant)>>,
+    org_of_team_cache: Mutex<std::collections::HashMap<i64, (i64, Instant)>>,
+    org_limits_cache: Mutex<std::collections::HashMap<i64, (crate::ratelimit::Limits, Instant)>>,
 }
 
 impl CachedKeyStore {
@@ -391,6 +572,10 @@ impl CachedKeyStore {
             user_limits_cache: Mutex::new(Default::default()),
             project_of_user_cache: Mutex::new(Default::default()),
             project_limits_cache: Mutex::new(Default::default()),
+            team_of_project_cache: Mutex::new(Default::default()),
+            team_limits_cache: Mutex::new(Default::default()),
+            org_of_team_cache: Mutex::new(Default::default()),
+            org_limits_cache: Mutex::new(Default::default()),
         }
     }
 
@@ -474,6 +659,82 @@ impl CachedKeyStore {
         Ok(l)
     }
 
+    /// Team membership of a project with cache (0 = none).
+    pub async fn team_of_project(&self, project_id: i64) -> Result<i64, String> {
+        let now = Instant::now();
+        {
+            let cache = self.team_of_project_cache.lock().unwrap();
+            if let Some((tid, at)) = cache.get(&project_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*tid);
+                }
+            }
+        }
+        let tid = self.svc.team_of_project(project_id).await?;
+        self.team_of_project_cache
+            .lock()
+            .unwrap()
+            .insert(project_id, (tid, now));
+        Ok(tid)
+    }
+
+    /// Team-level aggregate quota with cache.
+    pub async fn team_limits(&self, team_id: i64) -> Result<crate::ratelimit::Limits, String> {
+        let now = Instant::now();
+        {
+            let cache = self.team_limits_cache.lock().unwrap();
+            if let Some((l, at)) = cache.get(&team_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*l);
+                }
+            }
+        }
+        let l = self.svc.resolve_team_limits(team_id).await?;
+        self.team_limits_cache
+            .lock()
+            .unwrap()
+            .insert(team_id, (l, now));
+        Ok(l)
+    }
+
+    /// Org membership of a team with cache (0 = none).
+    pub async fn org_of_team(&self, team_id: i64) -> Result<i64, String> {
+        let now = Instant::now();
+        {
+            let cache = self.org_of_team_cache.lock().unwrap();
+            if let Some((oid, at)) = cache.get(&team_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*oid);
+                }
+            }
+        }
+        let oid = self.svc.org_of_team(team_id).await?;
+        self.org_of_team_cache
+            .lock()
+            .unwrap()
+            .insert(team_id, (oid, now));
+        Ok(oid)
+    }
+
+    /// Org-level aggregate quota with cache.
+    pub async fn org_limits(&self, org_id: i64) -> Result<crate::ratelimit::Limits, String> {
+        let now = Instant::now();
+        {
+            let cache = self.org_limits_cache.lock().unwrap();
+            if let Some((l, at)) = cache.get(&org_id) {
+                if now.duration_since(*at) < self.ttl {
+                    return Ok(*l);
+                }
+            }
+        }
+        let l = self.svc.resolve_org_limits(org_id).await?;
+        self.org_limits_cache
+            .lock()
+            .unwrap()
+            .insert(org_id, (l, now));
+        Ok(l)
+    }
+
     /// Resolve with cache (negative entries cached shorter).
     pub async fn resolve(&self, raw_key: &str) -> Result<i64, String> {
         let now = Instant::now();
@@ -534,6 +795,7 @@ mod tests {
                     rpm: 3,
                     tpm: 100,
                     concurrency: 2,
+                    ..Default::default()
                 },
             )
             .await;
@@ -545,7 +807,8 @@ mod tests {
                     crate::ratelimit::Limits {
                         rpm: 3,
                         tpm: 100,
-                        concurrency: 2
+                        concurrency: 2,
+                        ..Default::default()
                     }
                 );
                 println!(
@@ -631,5 +894,93 @@ mod tests {
         let got = svc.project_of_user(uid).await.expect("membership");
         assert_eq!(got, pid, "user must belong to the project");
         println!("project OK: pid={pid} rpm=10 tpm=5000 uid={uid}");
+    }
+
+    /// Org → team → project chain roundtrip (layers 3-5).
+    #[tokio::test]
+    async fn org_team_chain_roundtrip() {
+        let Ok(dsn) = std::env::var("STARGATE_TEST_PG") else {
+            eprintln!("skipping: STARGATE_TEST_PG not set");
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
+            .await
+            .expect("pg connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let svc = AuthService {
+            client: Arc::new(client),
+        };
+        svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
+
+        let oid = svc.create_org("chain-org", 0, 0).await.expect("create org");
+        let tid = svc
+            .create_team("chain-team", oid, 0, 0)
+            .await
+            .expect("create team");
+        let pid = svc
+            .create_project("chain-proj", 0, 0)
+            .await
+            .expect("create project");
+
+        svc.set_org_limits(oid, 100, 50000)
+            .await
+            .expect("org limits");
+        svc.set_team_limits(tid, 50, 20000)
+            .await
+            .expect("team limits");
+        svc.set_project_team(pid, tid).await.expect("project team");
+
+        let got_tid = svc.team_of_project(pid).await.expect("team of project");
+        assert_eq!(got_tid, tid);
+        let got_oid = svc.org_of_team(tid).await.expect("org of team");
+        assert_eq!(got_oid, oid);
+
+        let ol = svc.resolve_org_limits(oid).await.expect("org limits read");
+        assert_eq!((ol.rpm, ol.tpm), (100, 50000));
+        let tl = svc
+            .resolve_team_limits(tid)
+            .await
+            .expect("team limits read");
+        assert_eq!((tl.rpm, tl.tpm), (50, 20000));
+        println!("chain OK: org={oid} team={tid} project={pid}");
+    }
+
+    /// End-user quotas roundtrip (layer 6).
+    #[tokio::test]
+    async fn end_user_limits_roundtrip() {
+        let Ok(dsn) = std::env::var("STARGATE_TEST_PG") else {
+            eprintln!("skipping: STARGATE_TEST_PG not set");
+            return;
+        };
+        let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
+            .await
+            .expect("pg connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let svc = AuthService {
+            client: Arc::new(client),
+        };
+        svc.client.batch_execute(COMMERCIAL_SCHEMA).await.unwrap();
+        let username = format!("eu-probe-{}", std::process::id());
+        let uid = svc.register(&username, "password123").await.unwrap();
+        let key = svc
+            .create_key(
+                uid,
+                "eu-key",
+                crate::ratelimit::Limits {
+                    end_user_rpm: 3,
+                    end_user_tpm: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create key");
+        let l = svc.resolve_limits(&key).await.expect("resolve");
+        assert_eq!(l.end_user_rpm, 3);
+        assert_eq!(l.end_user_tpm, 1000);
+        println!("end_user OK: rpm=3 tpm=1000");
     }
 }

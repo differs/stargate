@@ -68,6 +68,7 @@ pub trait RateLimiter: Send + Sync {
         &'a self,
         raw_key: &'a str,
         prompt_tokens: u32,
+        end_user_id: &'a str,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -233,7 +234,13 @@ async fn handle_chat(
     // The guard (if any) releases the in-flight slot when dropped.
     let mut _rate_guard = None;
     if let Some(limiter) = &state.limiter {
-        match limiter.allow(&raw_key, prompt_tokens).await {
+        let end_user = headers
+            .get("x-end-user")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        match limiter.allow(&raw_key, prompt_tokens, &end_user).await {
             Ok(guard) => _rate_guard = guard,
             Err(exceeded) => {
                 record_http(429);

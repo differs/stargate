@@ -20,6 +20,9 @@ pub struct Limits {
     pub rpm: u64,
     pub tpm: u64,
     pub concurrency: u64,
+    /// Layer 6: per end-user quotas of a key (scoped eu:{key}:{id}).
+    pub end_user_rpm: u64,
+    pub end_user_tpm: u64,
 }
 
 /// Sliding-window length.
@@ -215,18 +218,46 @@ impl KeyLimiter {
     /// Ok(Some(guard)) = hold the guard until the request finishes;
     /// Ok(None) = unlimited or no concurrency slot needed;
     /// Err(QuotaExceeded) = over a limit (layer + retry-after).
+    /// Check the key layer (RPM → TPM → concurrency) then the aggregate
+    /// chain: user → project → team → org, plus the per end-user layer.
+    /// Ok(Some(guard)) = hold the guard until the request finishes;
+    /// Ok(None) = unlimited or no concurrency slot needed;
+    /// Err(QuotaExceeded) = over a limit (layer + retry-after).
     pub async fn check(
         &self,
         raw_key: &str,
         prompt_tokens: u32,
+        end_user_id: &str,
     ) -> Result<Option<ConcurrencyGuard>, QuotaExceeded> {
         let layer = |r: u64| QuotaExceeded {
             retry_after: r,
             layer: "key",
         };
 
-        // --- Layer 1: per-key limits (cached) ---
+        // --- Layer 6: per end-user limits of this key (only when the
+        // request carries X-End-User and the key has end-user quotas) ---
         let limits = self.keys.limits(raw_key).await.ok().unwrap_or_default();
+        if !end_user_id.is_empty() && (limits.end_user_rpm > 0 || limits.end_user_tpm > 0) {
+            let eu_layer = |r: u64| QuotaExceeded {
+                retry_after: r,
+                layer: "end_user",
+            };
+            let eu_scope = format!("eu:{raw_key}:{end_user_id}");
+            if limits.end_user_rpm > 0 {
+                self.check
+                    .check_rpm(&eu_scope, limits.end_user_rpm)
+                    .await
+                    .map_err(eu_layer)?;
+            }
+            if limits.end_user_tpm > 0 {
+                self.check
+                    .check_tpm(&eu_scope, limits.end_user_tpm, prompt_tokens as u64 + 1000)
+                    .await
+                    .map_err(eu_layer)?;
+            }
+        }
+
+        // --- Layer 1: per-key limits (cached) ---
         if limits.rpm > 0 {
             self.check
                 .check_rpm(raw_key, limits.rpm)
@@ -252,7 +283,7 @@ impl KeyLimiter {
             }
         }
 
-        // --- Layer 2: user-level aggregate budget (shared across keys) ---
+        // --- Layers 2-5: user → project → team → org aggregate budgets ---
         if let Ok(uid) = self.keys.resolve(raw_key).await {
             let user_layer = |r: u64| QuotaExceeded {
                 retry_after: r,
@@ -276,7 +307,6 @@ impl KeyLimiter {
                 }
             }
 
-            // --- Layer 3: project-level budget (shared across users) ---
             if let Ok(pid) = self.keys.project_of_user(uid).await {
                 if pid > 0 {
                     let project_layer = |r: u64| QuotaExceeded {
@@ -300,18 +330,76 @@ impl KeyLimiter {
                             }
                         }
                     }
+
+                    // --- Layer 4: team (project belongs to a team) ---
+                    if let Ok(tid) = self.keys.team_of_project(pid).await {
+                        if tid > 0 {
+                            let team_layer = |r: u64| QuotaExceeded {
+                                retry_after: r,
+                                layer: "team",
+                            };
+                            if let Ok(tl) = self.keys.team_limits(tid).await {
+                                if tl.rpm > 0 || tl.tpm > 0 {
+                                    let scope = format!("team-{tid}");
+                                    if tl.rpm > 0 {
+                                        self.check
+                                            .check_rpm(&scope, tl.rpm)
+                                            .await
+                                            .map_err(team_layer)?;
+                                    }
+                                    if tl.tpm > 0 {
+                                        self.check
+                                            .check_tpm(&scope, tl.tpm, prompt_tokens as u64 + 1000)
+                                            .await
+                                            .map_err(team_layer)?;
+                                    }
+                                }
+                            }
+
+                            // --- Layer 5: org (team belongs to an org) ---
+                            if let Ok(oid) = self.keys.org_of_team(tid).await {
+                                if oid > 0 {
+                                    let org_layer = |r: u64| QuotaExceeded {
+                                        retry_after: r,
+                                        layer: "org",
+                                    };
+                                    if let Ok(ol) = self.keys.org_limits(oid).await {
+                                        if ol.rpm > 0 || ol.tpm > 0 {
+                                            let scope = format!("org-{oid}");
+                                            if ol.rpm > 0 {
+                                                self.check
+                                                    .check_rpm(&scope, ol.rpm)
+                                                    .await
+                                                    .map_err(org_layer)?;
+                                            }
+                                            if ol.tpm > 0 {
+                                                self.check
+                                                    .check_tpm(
+                                                        &scope,
+                                                        ol.tpm,
+                                                        prompt_tokens as u64 + 1000,
+                                                    )
+                                                    .await
+                                                    .map_err(org_layer)?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
         Ok(None)
     }
 }
-
 impl crate::gateway::RateLimiter for KeyLimiter {
     fn allow<'a>(
         &'a self,
         raw_key: &'a str,
         prompt_tokens: u32,
+        end_user_id: &'a str,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<Option<ConcurrencyGuard>, QuotaExceeded>>
@@ -319,7 +407,7 @@ impl crate::gateway::RateLimiter for KeyLimiter {
                 + 'a,
         >,
     > {
-        Box::pin(async move { self.check(raw_key, prompt_tokens).await })
+        Box::pin(async move { self.check(raw_key, prompt_tokens, end_user_id).await })
     }
 }
 

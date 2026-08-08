@@ -126,6 +126,20 @@ pub fn router(state: Arc<PortalState>) -> Router {
         .route(
             "/api/admin/projects/{id}/limits",
             axum::routing::put(set_project_limits),
+        )
+        .route(
+            "/api/admin/projects/{id}/team",
+            axum::routing::put(set_project_team),
+        )
+        .route("/api/admin/orgs", axum::routing::post(create_org))
+        .route(
+            "/api/admin/orgs/{id}/limits",
+            axum::routing::put(set_org_limits),
+        )
+        .route("/api/admin/teams", axum::routing::post(create_team))
+        .route(
+            "/api/admin/teams/{id}/limits",
+            axum::routing::put(set_team_limits),
         );
     if let Some(dir) = &state.web_dir {
         app = app.fallback_service(tower_http::services::ServeDir::new(dir));
@@ -330,6 +344,164 @@ struct SetLimitsReq {
     tpm_limit: u64,
 }
 
+/// Attach a project to a team (layer 4).
+async fn set_project_team(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(project_id): axum::extract::Path<i64>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    let team_id = req.get("team_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if team_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"message": "team_id required"}})),
+        )
+            .into_response();
+    }
+    match st.auth.set_project_team(project_id, team_id).await {
+        Ok(()) => {
+            Json(serde_json::json!({"project_id": project_id, "team_id": team_id})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Create an org with an aggregate quota (layer 5).
+async fn create_org(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    let name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rpm = req.get("rpm_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    let tpm = req.get("tpm_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"message": "name required"}})),
+        )
+            .into_response();
+    }
+    match st.auth.create_org(&name, rpm, tpm).await {
+        Ok(id) => {
+            Json(serde_json::json!({"id": id, "name": name, "rpm_limit": rpm, "tpm_limit": tpm}))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("create failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Update an org's aggregate quota.
+async fn set_org_limits(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(org_id): axum::extract::Path<i64>,
+    Json(req): Json<SetLimitsReq>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    match st
+        .auth
+        .set_org_limits(org_id, req.rpm_limit, req.tpm_limit)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "org_id": org_id,
+            "rpm_limit": req.rpm_limit,
+            "tpm_limit": req.tpm_limit,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Create a team inside an org (layer 4).
+async fn create_team(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    let name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let org_id = req.get("org_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let rpm = req.get("rpm_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    let tpm = req.get("tpm_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    if name.is_empty() || org_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"message": "name and org_id required"}})),
+        )
+            .into_response();
+    }
+    match st.auth.create_team(&name, org_id, rpm, tpm).await {
+        Ok(id) => Json(serde_json::json!({"id": id, "name": name, "org_id": org_id, "rpm_limit": rpm, "tpm_limit": tpm})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("create failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Update a team's aggregate quota.
+async fn set_team_limits(
+    State(st): State<Arc<PortalState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(team_id): axum::extract::Path<i64>,
+    Json(req): Json<SetLimitsReq>,
+) -> Response {
+    if !admin_key_only(&st, &headers) {
+        return unauthorized();
+    }
+    match st
+        .auth
+        .set_team_limits(team_id, req.rpm_limit, req.tpm_limit)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "team_id": team_id,
+            "rpm_limit": req.rpm_limit,
+            "tpm_limit": req.tpm_limit,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": format!("update failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
 /// Platform policy endpoints require the admin key — session JWTs are
 /// NOT accepted (a stolen session must not change quotas).
 fn admin_key_only(state: &PortalState, headers: &axum::http::HeaderMap) -> bool {
@@ -484,6 +656,8 @@ struct KeyReq {
     rpm_limit: Option<u64>,
     tpm_limit: Option<u64>,
     concurrency_limit: Option<u64>,
+    end_user_rpm_limit: Option<u64>,
+    end_user_tpm_limit: Option<u64>,
 }
 
 async fn create_key(
@@ -503,6 +677,8 @@ async fn create_key(
         rpm: req.rpm_limit.unwrap_or(0),
         tpm: req.tpm_limit.unwrap_or(0),
         concurrency: req.concurrency_limit.unwrap_or(0),
+        end_user_rpm: req.end_user_rpm_limit.unwrap_or(0),
+        end_user_tpm: req.end_user_tpm_limit.unwrap_or(0),
     };
     match st
         .auth
